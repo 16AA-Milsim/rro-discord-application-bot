@@ -85,7 +85,7 @@ class ApplicationView(discord.ui.View):
                 self.add_item(note)
 
         stage_select = discord.ui.Select(
-            placeholder="Set stage tag…",
+            placeholder="Change status…",
             min_values=1,
             max_values=1,
             options=[

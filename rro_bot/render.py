@@ -67,10 +67,10 @@ def build_application_embed(
         description=f"Submitted by **{topic.author}**",
         color=0x940039,
     )
-    embed.add_field(name="Status", value=stage_label, inline=True)
+    embed.add_field(name="Status", value=stage_label, inline=False)
     embed.add_field(
-        name="Handler",
+        name="Owner",
         value=claimed_by.mention if claimed_by else "Unassigned",
-        inline=True,
+        inline=False,
     )
     return RenderedApplication(embed=embed)

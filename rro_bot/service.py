@@ -46,6 +46,7 @@ class BotService(discord.Client):
         self.config = config
         self.db = db
         self.discourse = discourse
+        self._topic_locks: dict[int, asyncio.Lock] = {}
 
     async def setup_hook(self) -> None:
         await self.db.init()
@@ -200,6 +201,23 @@ class BotService(discord.Client):
         return rendered.embed, view
 
     async def handle_discourse_topic_event(
+        self,
+        *,
+        topic_id: int,
+        event_type: str = "",
+        discourse_actor: str | None = None,
+    ) -> None:
+        # Multiple Discourse webhooks/events can arrive for the same topic in quick succession.
+        # Serialize per-topic processing to avoid duplicate Discord posts.
+        lock = self._topic_locks.setdefault(topic_id, asyncio.Lock())
+        async with lock:
+            await self._handle_discourse_topic_event_inner(
+                topic_id=topic_id,
+                event_type=event_type,
+                discourse_actor=discourse_actor,
+            )
+
+    async def _handle_discourse_topic_event_inner(
         self,
         *,
         topic_id: int,
@@ -387,7 +405,7 @@ class BotService(discord.Client):
         if thread:
             await thread.send(
                 f"{self._discord_ts()} Thread opened.\n"
-                f"Handler: {interaction.user.mention}\n"
+                f"Owner: {interaction.user.mention}\n"
                 f"Topic: {topic.url}\n"
                 f"Status: {discourse_tags_to_stage_label(topic.tags)}"
             )
@@ -423,7 +441,7 @@ class BotService(discord.Client):
         prev_text = previous.mention if previous else "someone"
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Unclaimed by {interaction.user.mention} (previous handler: {prev_text}).",
+            message=f"Unclaimed by {interaction.user.mention} (previous owner: {prev_text}).",
         )
 
     async def handle_reassign(self, interaction: discord.Interaction, *, topic_id: int) -> None:
