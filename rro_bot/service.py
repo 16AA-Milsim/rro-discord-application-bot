@@ -594,11 +594,28 @@ async def run() -> None:
         await site.start()
 
         log.info("Webhook server listening on http://%s:%s", config.listen_host, config.listen_port)
-        await bot.start(config.discord_bot_token)
+        try:
+            await bot.start(config.discord_bot_token)
+        except asyncio.CancelledError:
+            # Normal shutdown path when Ctrl+C is pressed (asyncio.run cancels main task).
+            pass
+        finally:
+            try:
+                await bot.close()
+            except Exception:
+                pass
+            try:
+                await runner.cleanup()
+            except Exception:
+                pass
 
 
 def main() -> None:
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        # Graceful Ctrl+C without a stack trace.
+        return
 
 
 if __name__ == "__main__":

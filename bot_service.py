@@ -8,4 +8,7 @@ from rro_bot.service import main
 if __name__ == "__main__":
     if load_dotenv:
         load_dotenv()
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
