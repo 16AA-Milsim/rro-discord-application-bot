@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from aiohttp import web
@@ -47,6 +47,7 @@ class BotService(discord.Client):
         self.db = db
         self.discourse = discourse
         self._topic_locks: dict[int, asyncio.Lock] = {}
+        self._archive_tasks: dict[int, asyncio.Task] = {}
 
     async def setup_hook(self) -> None:
         await self.db.init()
@@ -54,6 +55,7 @@ class BotService(discord.Client):
     async def on_ready(self) -> None:
         log.info("Logged in as %s", self.user)
         await self._restore_views()
+        await self._restore_scheduled_archives()
 
     async def _restore_views(self) -> None:
         for record in await self.db.list_applications():
@@ -64,6 +66,124 @@ class BotService(discord.Client):
                     claimed=record.claimed_by_user_id is not None,
                 )
             )
+
+    async def _restore_scheduled_archives(self) -> None:
+        now = datetime.now(timezone.utc)
+        for record in await self.db.list_applications():
+            if record.archived_at:
+                continue
+            if not record.archive_scheduled_at:
+                continue
+            try:
+                when = datetime.fromisoformat(record.archive_scheduled_at)
+            except Exception:
+                continue
+            delay = max(0.0, (when - now).total_seconds())
+            self._schedule_archive(topic_id=record.topic_id, delay_seconds=delay, reason="restore")
+
+    @staticmethod
+    def _is_accepted(tags: list[str]) -> bool:
+        return "p-file" in set(tags)
+
+    def _schedule_archive(self, *, topic_id: int, delay_seconds: float, reason: str) -> None:
+        existing = self._archive_tasks.get(topic_id)
+        if existing and not existing.done():
+            return
+
+        async def _runner() -> None:
+            try:
+                await asyncio.sleep(delay_seconds)
+                await self._archive_topic_if_accepted(topic_id=topic_id)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("Archive task failed (topic_id=%s, reason=%s)", topic_id, reason)
+
+        self._archive_tasks[topic_id] = asyncio.create_task(_runner())
+
+    def _cancel_archive(self, *, topic_id: int) -> None:
+        task = self._archive_tasks.get(topic_id)
+        if task and not task.done():
+            task.cancel()
+
+    async def _archive_topic_if_accepted(self, *, topic_id: int) -> None:
+        record = await self.db.get_application(topic_id)
+        if not record or record.archived_at:
+            return
+
+        topic = await self.discourse.fetch_topic(topic_id)
+        if not self._is_accepted(topic.tags):
+            await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
+            return
+
+        notify_msg = await self._get_notify_message(topic_id=topic_id)
+
+        # Ensure we have a thread; if acceptance happened without a claim/thread, create one.
+        thread = await self._get_thread_for_topic(topic_id=topic_id)
+        if thread is None and notify_msg:
+            channel = self.get_channel(record.discord_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                _ = await self._create_thread_if_needed(
+                    channel=channel,
+                    message=notify_msg,
+                    topic_title=topic.title,
+                    topic_id=topic_id,
+                )
+                thread = await self._get_thread_for_topic(topic_id=topic_id)
+
+        thread_link = None
+        if thread:
+            guild_id, _ = self._target_ids()
+            thread_link = f"https://discord.com/channels/{guild_id}/{thread.id}"
+
+        # Main channel: keep a minimal Accepted stub, remove controls.
+        if notify_msg:
+            embed, _view = await self._render_for_topic(topic_id=topic_id)
+            embed.add_field(
+                name="Archive",
+                value=f"[Open thread]({thread_link})" if thread_link else "Thread not available",
+                inline=False,
+            )
+            await notify_msg.edit(embed=embed, view=None)
+
+        # Thread: disable controls and lock/archive.
+        if thread and record.discord_control_message_id:
+            try:
+                controls_msg = await thread.fetch_message(record.discord_control_message_id)
+                embed = controls_msg.embeds[0] if controls_msg.embeds else None
+                await controls_msg.edit(content="Archived (Accepted)", embed=embed, view=None)
+            except Exception:
+                pass
+        if thread:
+            try:
+                await thread.edit(locked=True, archived=True)
+            except Exception:
+                pass
+
+        # Optional: post summary in archive channel.
+        archive_channel_id = self.config.target_archive_channel_id()
+        if archive_channel_id:
+            archive_channel = self.get_channel(archive_channel_id)
+            if archive_channel is None:
+                try:
+                    archive_channel = await self.fetch_channel(archive_channel_id)
+                except Exception:
+                    archive_channel = None
+            if isinstance(archive_channel, discord.TextChannel):
+                owner = await self._resolve_claimed_user(user_id=record.claimed_by_user_id)
+                status = discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())
+                embed = discord.Embed(
+                    title=f"📄 {topic.title}",
+                    url=topic.url,
+                    color=0x2ecc71,
+                    description=f"Owner: {owner.mention if owner else '⚠️ Unassigned'}\nStatus: {status}",
+                )
+                if thread_link:
+                    embed.add_field(name="Thread", value=f"[Open]({thread_link})", inline=False)
+                await archive_channel.send(content="✅ Accepted (Archived)", embed=embed)
+
+        await self.db.mark_archived(topic_id=topic_id, archived=True)
+        await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
 
     def _target_ids(self) -> tuple[int, int]:
         return self.config.target_guild_and_channel()
@@ -172,6 +292,8 @@ class BotService(discord.Client):
         record = await self.db.get_application(topic_id)
         if not record or not record.discord_thread_id:
             return
+        if record.archived_at:
+            return
         thread = await self._get_thread_for_topic(topic_id=topic_id)
         if not thread:
             return
@@ -189,10 +311,6 @@ class BotService(discord.Client):
         if controls_msg is None:
             controls_msg = await thread.send(content="Controls", embed=embed, view=view)
             await self.db.set_control_message_id(topic_id=topic_id, message_id=controls_msg.id)
-            try:
-                await controls_msg.pin()
-            except Exception:
-                pass
         else:
             try:
                 await controls_msg.edit(content="Controls", embed=embed, view=view)
@@ -335,6 +453,25 @@ class BotService(discord.Client):
             await self.db.set_tags_last_seen(topic_id=topic_id, tags=topic.tags)
             await self._ensure_thread_controls(topic_id=topic_id)
 
+            # Schedule delayed archive when Accepted arrives from Discourse.
+            if previous_tags is not None:
+                became_accepted = (not self._is_accepted(previous_tags)) and self._is_accepted(topic.tags)
+                reopened = self._is_accepted(previous_tags) and (not self._is_accepted(topic.tags))
+                if became_accepted:
+                    when = datetime.now(timezone.utc) + timedelta(minutes=30)
+                    await self.db.mark_accepted(topic_id=topic_id, accepted=True)
+                    await self.db.schedule_archive(topic_id=topic_id, when_iso=when.isoformat())
+                    self._schedule_archive(topic_id=topic_id, delay_seconds=30 * 60, reason="discourse-accepted")
+                    await self._thread_log(
+                        topic_id=topic_id,
+                        message="Accepted. Archiving in 30 minutes (you can revert status until then).",
+                    )
+                elif reopened:
+                    await self.db.mark_accepted(topic_id=topic_id, accepted=False)
+                    await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
+                    self._cancel_archive(topic_id=topic_id)
+                    await self._thread_log(topic_id=topic_id, message="Reopened (Accepted removed).")
+
             # If Discourse tags changed, log it in the thread (if one exists), unless it matches
             # tags we just wrote from Discord (to avoid duplicate "echo" logs).
             if previous_tags is not None and previous_tags != topic.tags:
@@ -372,6 +509,12 @@ class BotService(discord.Client):
             discord_thread_id=None,
             tags_last_seen=topic.tags,
         )
+
+        if self._is_accepted(topic.tags):
+            when = datetime.now(timezone.utc) + timedelta(minutes=30)
+            await self.db.mark_accepted(topic_id=topic_id, accepted=True)
+            await self.db.schedule_archive(topic_id=topic_id, when_iso=when.isoformat())
+            self._schedule_archive(topic_id=topic_id, delay_seconds=30 * 60, reason="discourse-accepted-initial")
 
     async def _create_thread_if_needed(
         self,
@@ -449,6 +592,7 @@ class BotService(discord.Client):
         if not record:
             await interaction.response.send_message("Internal error: missing record.", ephemeral=True)
             return
+        had_thread = bool(record.discord_thread_id)
 
         channel = self.get_channel(record.discord_channel_id)
         if not isinstance(channel, discord.TextChannel):
@@ -481,15 +625,9 @@ class BotService(discord.Client):
             topic_id=topic_id,
         )
         _ = thread_id
-        thread = await self._get_thread_for_topic(topic_id=topic_id)
-        if thread:
-            await thread.send(
-                f"{self._discord_ts()} Thread opened.\n"
-                f"Owner: {interaction.user.mention}\n"
-                f"Topic: {topic.url}\n"
-                f"Status: **{discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())}**"
-            )
         await self._ensure_thread_controls(topic_id=topic_id)
+        if not had_thread:
+            await self._thread_log(topic_id=topic_id, message="Thread created.")
         await self._thread_log(topic_id=topic_id, message=f"Claimed by {interaction.user.mention}.")
 
         await self.handle_discourse_topic_event(topic_id=topic_id)
@@ -614,7 +752,7 @@ class BotService(discord.Client):
         prev_text = previous.mention if previous else "Unassigned"
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Reassigned by {interaction.user.mention}: {prev_text} → <@{new_user_id}>.",
+            message=f"Reassigned by {interaction.user.mention}: {prev_text} -> <@{new_user_id}>.",
         )
 
     async def handle_set_stage(self, interaction: discord.Interaction, *, topic_id: int, stage_tag: str) -> None:
@@ -655,9 +793,24 @@ class BotService(discord.Client):
         await self.handle_discourse_topic_event(topic_id=topic_id)
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Status (discord) changed by {interaction.user.mention}: **{prev_stage}** → **{new_stage}**",
+            message=f"Status (discord) changed by {interaction.user.mention}: **{prev_stage}** -> **{new_stage}**",
         )
         await self._ensure_thread_controls(topic_id=topic_id)
+
+        if stage_tag == "p-file":
+            when = datetime.now(timezone.utc) + timedelta(minutes=30)
+            await self.db.mark_accepted(topic_id=topic_id, accepted=True)
+            await self.db.schedule_archive(topic_id=topic_id, when_iso=when.isoformat())
+            self._schedule_archive(topic_id=topic_id, delay_seconds=30 * 60, reason="discord-accepted")
+            await self._thread_log(
+                topic_id=topic_id,
+                message="Accepted. Archiving in 30 minutes (you can revert status until then).",
+            )
+        elif self._is_accepted(current) and stage_tag != "p-file":
+            await self.db.mark_accepted(topic_id=topic_id, accepted=False)
+            await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
+            self._cancel_archive(topic_id=topic_id)
+            await self._thread_log(topic_id=topic_id, message="Reopened (Accepted removed).")
         # Update message without posting extra chatter.
         try:
             embed, view = await self._render_for_topic(topic_id=topic_id)

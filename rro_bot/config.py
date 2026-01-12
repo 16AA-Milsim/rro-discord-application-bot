@@ -39,6 +39,7 @@ class BotConfig:
     discord_notify_channel_id: int
     discord_test_guild_id: int
     discord_test_notify_channel_id: int
+    discord_test_archive_channel_id: int
 
     discord_allowed_role_names: tuple[str, ...]
     discord_override_role_names: tuple[str, ...]
@@ -74,6 +75,14 @@ class BotConfig:
             return self.discord_guild_id, self.discord_notify_channel_id
         raise RuntimeError(f"Invalid DISCORD_MODE: {self.discord_mode!r} (expected prod|test|dry-run)")
 
+    def target_archive_channel_id(self) -> int:
+        mode = self.discord_mode.lower()
+        if mode in ("test", "dry-run"):
+            return self.discord_test_archive_channel_id
+        if mode == "prod":
+            return 0
+        return 0
+
 
 def load_config() -> BotConfig:
     secrets_raw = os.environ.get("DISCOURSE_WEBHOOK_SECRETS", "").strip()
@@ -93,6 +102,7 @@ def load_config() -> BotConfig:
         discord_test_notify_channel_id=_get_env_int(
             "DISCORD_TEST_NOTIFY_CHANNEL_ID", 1460263195292864552
         ),
+        discord_test_archive_channel_id=_get_env_int("DISCORD_TEST_ARCHIVE_CHANNEL_ID", 0),
         discord_allowed_role_names=tuple(
             _split_csv(os.environ.get("DISCORD_ALLOWED_ROLE_NAMES", "RRO,RRO ICs"))
         ),

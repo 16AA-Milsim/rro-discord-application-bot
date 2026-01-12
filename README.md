@@ -35,6 +35,7 @@ Required:
 - `DISCORD_MODE` (`test` | `dry-run` | `prod`)
 - `DISCORD_TEST_GUILD_ID` (default: `1068904351692771480`)
 - `DISCORD_TEST_NOTIFY_CHANNEL_ID` (default: `1460263195292864552`)
+- `DISCORD_TEST_ARCHIVE_CHANNEL_ID` (optional; post accepted summaries here)
 - `DISCOURSE_BASE_URL` (default: `https://discourse.16aa.net`)
 - `LISTEN_HOST` (default: `0.0.0.0`)
 - `LISTEN_PORT` (default: `5055`)
@@ -82,3 +83,4 @@ python .\\bot_service.py
 
 - Discord threads always have an auto-archive setting; “no auto-archive” is not supported. This bot sets it to the maximum available.
 - Reassign dropdown needs Discord “Server Members Intent” enabled for the bot so it can list eligible members.
+- When status becomes Accepted (`p-file`), the bot waits 30 minutes (during which status can be reverted), then archives: removes controls from the main card, disables controls in the thread, locks+archives the thread, and optionally posts a summary to `DISCORD_TEST_ARCHIVE_CHANNEL_ID`.
