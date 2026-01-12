@@ -70,10 +70,9 @@ def build_application_embed(
     embed.add_field(name="Stage", value=stage_label, inline=True)
     embed.add_field(name="Tags", value=format_tag_list(tags_discord), inline=False)
     embed.add_field(
-        name="Claim",
-        value=f"Claimed by {claimed_by.mention}" if claimed_by else "Unclaimed",
+        name="Handler",
+        value=claimed_by.mention if claimed_by else "Unassigned",
         inline=True,
     )
     embed.set_footer(text="Discourse → RRO Applications")
     return RenderedApplication(embed=embed)
-

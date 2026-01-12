@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+from datetime import datetime, timezone
 
 import aiohttp
 from aiohttp import web
@@ -87,6 +88,32 @@ class BotService(discord.Client):
         except Exception:
             return None
 
+    @staticmethod
+    def _discord_ts() -> str:
+        # Example: <t:1700000000:f> renders as a formatted timestamp in Discord clients.
+        return f"<t:{int(datetime.now(timezone.utc).timestamp())}:f>"
+
+    async def _get_thread_for_topic(self, *, topic_id: int) -> discord.Thread | None:
+        record = await self.db.get_application(topic_id)
+        if not record or not record.discord_thread_id:
+            return None
+        thread = self.get_channel(record.discord_thread_id)
+        if thread is None:
+            try:
+                thread = await self.fetch_channel(record.discord_thread_id)
+            except Exception:
+                thread = None
+        return thread if isinstance(thread, discord.Thread) else None
+
+    async def _thread_log(self, *, topic_id: int, message: str) -> None:
+        thread = await self._get_thread_for_topic(topic_id=topic_id)
+        if not thread:
+            return
+        try:
+            await thread.send(f"{self._discord_ts()} {message}")
+        except Exception:
+            log.exception("Failed to send thread log (topic_id=%s)", topic_id)
+
     def _ensure_interaction_in_target(self, interaction: discord.Interaction) -> None:
         target_guild_id, target_channel_id = self._target_ids()
         if not interaction.guild or interaction.guild.id != target_guild_id:
@@ -128,8 +155,6 @@ class BotService(discord.Client):
                 members = []
 
         for m in members:
-            if m.bot:
-                continue
             if self._member_is_claim_eligible(m):
                 eligible.append((m.id, m.display_name))
 
@@ -167,7 +192,7 @@ class BotService(discord.Client):
         )
         return rendered.embed, view
 
-    async def handle_discourse_topic_event(self, *, topic_id: int) -> None:
+    async def handle_discourse_topic_event(self, *, topic_id: int, event_type: str = "") -> None:
         topic = await self.discourse.fetch_topic(topic_id)
         if topic.category_id != self.config.applications_category_id:
             return
@@ -185,6 +210,7 @@ class BotService(discord.Client):
             raise RuntimeError(f"Channel not found or not a text channel: {target_channel_id}")
 
         record = await self.db.get_application(topic_id)
+        previous_tags = list(record.tags_last_seen) if record else None
         claimed_user = None
         claimed = False
         if record and record.claimed_by_user_id:
@@ -206,6 +232,23 @@ class BotService(discord.Client):
                 msg = await channel.fetch_message(record.discord_message_id)
                 await msg.edit(embed=rendered.embed, view=view)
             await self.db.set_tags_last_seen(topic_id=topic_id, tags=topic.tags)
+
+            # If Discourse tags changed, log it in the thread (if one exists), unless it matches
+            # tags we just wrote from Discord (to avoid duplicate "echo" logs).
+            if previous_tags is not None and previous_tags != topic.tags:
+                suppress_echo = bool(
+                    record.tags_last_written is not None
+                    and sorted(record.tags_last_written) == sorted(topic.tags)
+                )
+                if not suppress_echo:
+                    await self._thread_log(
+                        topic_id=topic_id,
+                        message=(
+                            f"Discourse update ({event_type or 'topic'}): "
+                            f"tags `{', '.join(discourse_tags_to_discord(previous_tags)) or '(none)'}` "
+                            f"→ `{', '.join(discourse_tags_to_discord(topic.tags)) or '(none)'}`"
+                        ),
+                    )
             return
 
         if self.config.is_dry_run:
@@ -231,7 +274,7 @@ class BotService(discord.Client):
         if record and record.discord_thread_id:
             return record.discord_thread_id
 
-        base_name = f"Application - {topic_title}".strip()
+        base_name = f"{topic_title}".strip()
         thread_name = base_name[:100] if len(base_name) > 100 else base_name
 
         # Discord does not support disabling auto-archive. Prefer the maximum, but fall back
@@ -300,19 +343,16 @@ class BotService(discord.Client):
         thread_id = await self._create_thread_if_needed(
             message=msg, topic_title=topic.title, topic_id=topic_id
         )
-        thread = self.get_channel(thread_id)
-        if thread is None:
-            try:
-                thread = await self.fetch_channel(thread_id)
-            except Exception:
-                thread = None
-
-        if isinstance(thread, discord.Thread):
+        _ = thread_id
+        thread = await self._get_thread_for_topic(topic_id=topic_id)
+        if thread:
             await thread.send(
+                f"{self._discord_ts()} Thread opened.\n"
                 f"Handler: {interaction.user.mention}\n"
                 f"Topic: {topic.url}\n"
                 f"Tags: {', '.join(discourse_tags_to_discord(topic.tags)) or '(none)'}"
             )
+        await self._thread_log(topic_id=topic_id, message=f"Claimed by {interaction.user.mention}.")
 
         await self.handle_discourse_topic_event(topic_id=topic_id)
 
@@ -327,10 +367,11 @@ class BotService(discord.Client):
             await interaction.response.send_message("Unexpected user type.", ephemeral=True)
             return
 
-        if not self._member_has_admin_permission(interaction.user):
-            await interaction.response.send_message("Only override roles can unclaim.", ephemeral=True)
+        if not self._member_has_override_permission(interaction.user):
+            await interaction.response.send_message("Only RRO / ICs can unclaim.", ephemeral=True)
             return
 
+        before = await self.db.get_application(topic_id)
         await self.db.force_claim(topic_id=topic_id, user_id=None)
         if self.config.is_dry_run:
             await interaction.response.send_message("dry-run: unclaimed in DB.", ephemeral=True)
@@ -339,6 +380,12 @@ class BotService(discord.Client):
         embed, view = await self._render_for_topic(topic_id=topic_id)
         await interaction.response.edit_message(embed=embed, view=view)
         await self.handle_discourse_topic_event(topic_id=topic_id)
+        previous = await self._resolve_claimed_user(user_id=before.claimed_by_user_id) if before else None
+        prev_text = previous.mention if previous else "someone"
+        await self._thread_log(
+            topic_id=topic_id,
+            message=f"Unclaimed by {interaction.user.mention} (previous handler: {prev_text}).",
+        )
 
     async def handle_reassign(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
@@ -404,11 +451,18 @@ class BotService(discord.Client):
             )
             return
 
+        before = await self.db.get_application(topic_id)
         await self.db.force_claim(topic_id=topic_id, user_id=new_user_id)
         await self.handle_discourse_topic_event(topic_id=topic_id)
 
         embed, view = await self._render_for_topic(topic_id=topic_id, show_reassign_selector=False)
         await interaction.response.edit_message(embed=embed, view=view)
+        previous = await self._resolve_claimed_user(user_id=before.claimed_by_user_id) if before else None
+        prev_text = previous.mention if previous else "Unassigned"
+        await self._thread_log(
+            topic_id=topic_id,
+            message=f"Reassigned by {interaction.user.mention}: {prev_text} → <@{new_user_id}>.",
+        )
 
     async def handle_set_stage(self, interaction: discord.Interaction, *, topic_id: int, stage_tag: str) -> None:
         try:
@@ -444,6 +498,10 @@ class BotService(discord.Client):
         await self.discourse.set_topic_tags(topic_id, next_tags)
         await self.db.set_tags_last_written(topic_id=topic_id, tags=next_tags)
         await self.handle_discourse_topic_event(topic_id=topic_id)
+        await self._thread_log(
+            topic_id=topic_id,
+            message=f"Stage set by {interaction.user.mention}: `{stage_tag if stage_tag != 'p-file' else 'Accepted'}`.",
+        )
         # Update message without posting extra chatter.
         try:
             embed, view = await self._render_for_topic(topic_id=topic_id)
@@ -506,7 +564,7 @@ async def create_web_app(*, config: BotConfig, bot: BotService) -> web.Applicati
             return web.Response(status=200, text="Ignored (no topic id)")
 
         log.info("Webhook received. event=%r topic_id=%s", event_type, topic_id_int)
-        task = asyncio.create_task(bot.handle_discourse_topic_event(topic_id=topic_id_int))
+        task = asyncio.create_task(bot.handle_discourse_topic_event(topic_id=topic_id_int, event_type=event_type))
         task.add_done_callback(_log_task_exceptions)
         return web.Response(status=200, text="OK")
 
