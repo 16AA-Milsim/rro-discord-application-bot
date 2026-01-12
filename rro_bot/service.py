@@ -207,9 +207,17 @@ class BotService(discord.Client):
         msg = await channel.fetch_message(record.discord_message_id)
         topic = await self.discourse.fetch_topic(topic_id)
 
-        thread_id = await self._create_thread_if_needed(message=msg, topic_title=topic.title, topic_id=topic_id)
-        thread = await channel.fetch_thread(thread_id)
-        if thread:
+        thread_id = await self._create_thread_if_needed(
+            message=msg, topic_title=topic.title, topic_id=topic_id
+        )
+        thread = self.get_channel(thread_id)
+        if thread is None:
+            try:
+                thread = await self.fetch_channel(thread_id)
+            except Exception:
+                thread = None
+
+        if isinstance(thread, discord.Thread):
             await thread.send(
                 f"Handler: {interaction.user.mention}\n"
                 f"Topic: {topic.url}\n"
@@ -320,6 +328,7 @@ async def create_web_app(*, config: BotConfig, bot: BotService) -> web.Applicati
 
     async def discourse_handler(request: web.Request) -> web.Response:
         raw = await request.read()
+        event_type = request.headers.get("X-Discourse-Event", "").strip()
         sig = (
             request.headers.get("X-Discourse-Event-Signature", "")
             or request.headers.get("X-Discourse-Event-Signature-SHA256", "")
@@ -333,13 +342,18 @@ async def create_web_app(*, config: BotConfig, bot: BotService) -> web.Applicati
         except Exception:
             return web.Response(status=400, text="Invalid JSON")
 
-        topic = payload.get("topic") or {}
+        topic_obj = payload.get("topic")
+        topic = topic_obj if isinstance(topic_obj, dict) else {}
         topic_id = topic.get("id") or topic.get("topic_id") or payload.get("topic_id") or payload.get("id")
+        if topic_id is None and isinstance(topic_obj, dict):
+            topic_id = topic_obj.get("id") or topic_obj.get("topic_id")
         try:
             topic_id_int = int(topic_id)
         except Exception:
+            log.info("Ignored webhook (no topic id). event=%r keys=%s", event_type, list(payload.keys()))
             return web.Response(status=200, text="Ignored (no topic id)")
 
+        log.info("Webhook received. event=%r topic_id=%s", event_type, topic_id_int)
         task = asyncio.create_task(bot.handle_discourse_topic_event(topic_id=topic_id_int))
         task.add_done_callback(_log_task_exceptions)
         return web.Response(status=200, text="OK")

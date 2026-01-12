@@ -55,9 +55,31 @@ class DiscourseClient:
         category_id = int(topic.get("category_id") or 0)
 
         author = "Unknown"
-        created_by = topic.get("created_by") or {}
+        # Discourse topic JSON varies; try several common locations.
+        created_by = topic.get("created_by")
         if isinstance(created_by, dict):
             author = created_by.get("username") or created_by.get("name") or author
+
+        if author == "Unknown":
+            details = topic.get("details")
+            if isinstance(details, dict):
+                details_created_by = details.get("created_by")
+                if isinstance(details_created_by, dict):
+                    author = (
+                        details_created_by.get("username")
+                        or details_created_by.get("name")
+                        or author
+                    )
+
+        if author == "Unknown":
+            # Fallback to the first post in the stream.
+            post_stream = data.get("post_stream")
+            if isinstance(post_stream, dict):
+                posts = post_stream.get("posts")
+                if isinstance(posts, list) and posts:
+                    first = posts[0]
+                    if isinstance(first, dict):
+                        author = first.get("username") or first.get("name") or author
 
         return DiscourseTopic(
             id=int(topic.get("id") or topic_id),
@@ -85,4 +107,3 @@ class DiscourseClient:
             timeout=aiohttp.ClientTimeout(total=20),
         ) as r:
             r.raise_for_status()
-
