@@ -68,6 +68,16 @@ class BotService(discord.Client):
     def _target_ids(self) -> tuple[int, int]:
         return self.config.target_guild_and_channel()
 
+    def _status_icons(self) -> dict[str, str]:
+        guild_id, _ = self._target_ids()
+        guild = self.get_guild(guild_id)
+        if not guild:
+            return {}
+        icons: dict[str, str] = {}
+        for e in guild.emojis:
+            icons[e.name] = str(e)
+        return icons
+
     async def _resolve_claimed_user(self, *, user_id: int | None) -> discord.abc.User | None:
         if not user_id:
             return None
@@ -126,8 +136,68 @@ class BotService(discord.Client):
         target_guild_id, target_channel_id = self._target_ids()
         if not interaction.guild or interaction.guild.id != target_guild_id:
             raise PermissionError("Wrong guild for current DISCORD_MODE")
-        if not interaction.channel or interaction.channel.id != target_channel_id:
-            raise PermissionError("Wrong channel for current DISCORD_MODE")
+        if not interaction.channel:
+            raise PermissionError("Missing channel")
+
+    async def _ensure_interaction_allowed_for_topic(
+        self, interaction: discord.Interaction, *, topic_id: int
+    ) -> None:
+        self._ensure_interaction_in_target(interaction)
+        _, target_channel_id = self._target_ids()
+
+        channel = interaction.channel
+        if channel.id == target_channel_id:
+            return
+
+        # Allow interaction from the topic's own thread.
+        record = await self.db.get_application(topic_id)
+        if record and record.discord_thread_id and channel.id == record.discord_thread_id:
+            return
+
+        raise PermissionError("Wrong channel for current DISCORD_MODE")
+
+    async def _get_notify_message(self, *, topic_id: int) -> discord.Message | None:
+        record = await self.db.get_application(topic_id)
+        if not record:
+            return None
+        channel = self.get_channel(record.discord_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return None
+        try:
+            return await channel.fetch_message(record.discord_message_id)
+        except Exception:
+            return None
+
+    async def _ensure_thread_controls(self, *, topic_id: int) -> None:
+        record = await self.db.get_application(topic_id)
+        if not record or not record.discord_thread_id:
+            return
+        thread = await self._get_thread_for_topic(topic_id=topic_id)
+        if not thread:
+            return
+
+        # Send or update a pinned controls message in the thread.
+        embed, view = await self._render_for_topic(topic_id=topic_id)
+        controls_msg: discord.Message | None = None
+
+        if record.discord_control_message_id:
+            try:
+                controls_msg = await thread.fetch_message(record.discord_control_message_id)
+            except Exception:
+                controls_msg = None
+
+        if controls_msg is None:
+            controls_msg = await thread.send(content="Controls", embed=embed, view=view)
+            await self.db.set_control_message_id(topic_id=topic_id, message_id=controls_msg.id)
+            try:
+                await controls_msg.pin()
+            except Exception:
+                pass
+        else:
+            try:
+                await controls_msg.edit(content="Controls", embed=embed, view=view)
+            except Exception:
+                pass
 
     def _member_has_claim_permission(self, member: discord.Member) -> bool:
         allowed = {n.lower() for n in self.config.discord_allowed_role_names}
@@ -179,7 +249,7 @@ class BotService(discord.Client):
     ) -> tuple[discord.Embed, ApplicationView]:
         topic = await self.discourse.fetch_topic(topic_id)
         tags_discord = discourse_tags_to_discord(topic.tags)
-        stage_label = discourse_tags_to_stage_label(topic.tags)
+        stage_label = discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())
 
         record = await self.db.get_application(topic_id)
         claimed_user = claimed_by_override or await self._resolve_claimed_user(
@@ -229,7 +299,7 @@ class BotService(discord.Client):
             return
 
         tags_discord = discourse_tags_to_discord(topic.tags)
-        stage_label = discourse_tags_to_stage_label(topic.tags)
+        stage_label = discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())
 
         _, target_channel_id = self._target_ids()
         channel = self.get_channel(target_channel_id)
@@ -263,6 +333,7 @@ class BotService(discord.Client):
                 msg = await channel.fetch_message(record.discord_message_id)
                 await msg.edit(embed=rendered.embed, view=view)
             await self.db.set_tags_last_seen(topic_id=topic_id, tags=topic.tags)
+            await self._ensure_thread_controls(topic_id=topic_id)
 
             # If Discourse tags changed, log it in the thread (if one exists), unless it matches
             # tags we just wrote from Discord (to avoid duplicate "echo" logs).
@@ -279,7 +350,7 @@ class BotService(discord.Client):
                         topic_id=topic_id,
                         message=(
                             f"Status (discourse) changed by {actor}: "
-                            f"**{prev_stage}** → **{new_stage}**"
+                            f"**{prev_stage}** -> **{new_stage}**"
                         ),
                     )
             return
@@ -352,7 +423,7 @@ class BotService(discord.Client):
 
     async def handle_claim(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
-            self._ensure_interaction_in_target(interaction)
+            await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
             await interaction.response.send_message(str(e), ephemeral=True)
             return
@@ -392,7 +463,16 @@ class BotService(discord.Client):
             topic_id=topic_id,
             claimed_by_override=interaction.user,
         )
-        await interaction.response.edit_message(embed=embed, view=view)
+        notify_msg = await self._get_notify_message(topic_id=topic_id)
+        if notify_msg:
+            await notify_msg.edit(embed=embed, view=view)
+
+        # If the interaction happened on the notification message itself, respond by editing it.
+        # Otherwise, defer to avoid an ephemeral "Only you can see this" success message.
+        if interaction.message and interaction.message.id == record.discord_message_id:
+            await interaction.response.edit_message(embed=embed, view=view)
+        elif not interaction.response.is_done():
+            await interaction.response.defer(thinking=False)
 
         thread_id = await self._create_thread_if_needed(
             channel=channel,
@@ -407,15 +487,16 @@ class BotService(discord.Client):
                 f"{self._discord_ts()} Thread opened.\n"
                 f"Owner: {interaction.user.mention}\n"
                 f"Topic: {topic.url}\n"
-                f"Status: **{discourse_tags_to_stage_label(topic.tags)}**"
+                f"Status: **{discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())}**"
             )
+        await self._ensure_thread_controls(topic_id=topic_id)
         await self._thread_log(topic_id=topic_id, message=f"Claimed by {interaction.user.mention}.")
 
         await self.handle_discourse_topic_event(topic_id=topic_id)
 
     async def handle_unclaim(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
-            self._ensure_interaction_in_target(interaction)
+            await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
             await interaction.response.send_message(str(e), ephemeral=True)
             return
@@ -435,7 +516,12 @@ class BotService(discord.Client):
             return
 
         embed, view = await self._render_for_topic(topic_id=topic_id)
-        await interaction.response.edit_message(embed=embed, view=view)
+        notify_msg = await self._get_notify_message(topic_id=topic_id)
+        if notify_msg:
+            await notify_msg.edit(embed=embed, view=view)
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=False)
+        await self._ensure_thread_controls(topic_id=topic_id)
         await self.handle_discourse_topic_event(topic_id=topic_id)
         previous = await self._resolve_claimed_user(user_id=before.claimed_by_user_id) if before else None
         prev_text = previous.mention if previous else "someone"
@@ -446,7 +532,7 @@ class BotService(discord.Client):
 
     async def handle_reassign(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
-            self._ensure_interaction_in_target(interaction)
+            await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
             await interaction.response.send_message(str(e), ephemeral=True)
             return
@@ -466,7 +552,12 @@ class BotService(discord.Client):
             show_reassign_selector=True,
             reassign_options=options,
         )
-        await interaction.response.edit_message(embed=embed, view=view)
+        notify_msg = await self._get_notify_message(topic_id=topic_id)
+        if notify_msg:
+            await notify_msg.edit(embed=embed, view=view)
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=False)
+        await self._ensure_thread_controls(topic_id=topic_id)
 
     async def handle_force_claim(self, interaction: discord.Interaction, *, topic_id: int, new_user_id: int) -> None:
         await self.db.force_claim(topic_id=topic_id, user_id=new_user_id)
@@ -481,7 +572,7 @@ class BotService(discord.Client):
         new_user_id: int,
     ) -> None:
         try:
-            self._ensure_interaction_in_target(interaction)
+            await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
             await interaction.response.send_message(str(e), ephemeral=True)
             return
@@ -513,7 +604,12 @@ class BotService(discord.Client):
         await self.handle_discourse_topic_event(topic_id=topic_id)
 
         embed, view = await self._render_for_topic(topic_id=topic_id, show_reassign_selector=False)
-        await interaction.response.edit_message(embed=embed, view=view)
+        notify_msg = await self._get_notify_message(topic_id=topic_id)
+        if notify_msg:
+            await notify_msg.edit(embed=embed, view=view)
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=False)
+        await self._ensure_thread_controls(topic_id=topic_id)
         previous = await self._resolve_claimed_user(user_id=before.claimed_by_user_id) if before else None
         prev_text = previous.mention if previous else "Unassigned"
         await self._thread_log(
@@ -523,7 +619,7 @@ class BotService(discord.Client):
 
     async def handle_set_stage(self, interaction: discord.Interaction, *, topic_id: int, stage_tag: str) -> None:
         try:
-            self._ensure_interaction_in_target(interaction)
+            await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
             await interaction.response.send_message(str(e), ephemeral=True)
             return
@@ -561,10 +657,13 @@ class BotService(discord.Client):
             topic_id=topic_id,
             message=f"Status (discord) changed by {interaction.user.mention}: **{prev_stage}** → **{new_stage}**",
         )
+        await self._ensure_thread_controls(topic_id=topic_id)
         # Update message without posting extra chatter.
         try:
             embed, view = await self._render_for_topic(topic_id=topic_id)
-            await interaction.message.edit(embed=embed, view=view)
+            notify_msg = await self._get_notify_message(topic_id=topic_id)
+            if notify_msg:
+                await notify_msg.edit(embed=embed, view=view)
         except Exception:
             pass
 

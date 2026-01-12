@@ -18,6 +18,7 @@ class ApplicationRecord:
     discord_channel_id: int
     discord_message_id: int
     discord_thread_id: int | None
+    discord_control_message_id: int | None
     claimed_by_user_id: int | None
     tags_last_seen: list[str]
     tags_last_written: list[str] | None
@@ -39,6 +40,7 @@ class BotDb:
                     discord_channel_id INTEGER NOT NULL,
                     discord_message_id INTEGER NOT NULL,
                     discord_thread_id INTEGER,
+                    discord_control_message_id INTEGER,
                     claimed_by_user_id INTEGER,
                     tags_last_seen TEXT NOT NULL,
                     tags_last_written TEXT,
@@ -48,6 +50,11 @@ class BotDb:
                 )
                 """
             )
+            # Lightweight migrations for existing DBs
+            try:
+                await db.execute("ALTER TABLE applications ADD COLUMN discord_control_message_id INTEGER")
+            except Exception:
+                pass
             await db.commit()
 
     async def upsert_application(
@@ -65,10 +72,11 @@ class BotDb:
                 """
                 INSERT INTO applications (
                     topic_id, discord_channel_id, discord_message_id, discord_thread_id,
+                    discord_control_message_id,
                     claimed_by_user_id, tags_last_seen, tags_last_written, tags_written_at,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, ?, ?)
                 ON CONFLICT(topic_id) DO UPDATE SET
                     discord_channel_id=excluded.discord_channel_id,
                     discord_message_id=excluded.discord_message_id,
@@ -139,6 +147,15 @@ class BotDb:
             )
             await db.commit()
 
+    async def set_control_message_id(self, *, topic_id: int, message_id: int | None) -> None:
+        now = _now_iso()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                "UPDATE applications SET discord_control_message_id=?, updated_at=? WHERE topic_id=?",
+                (message_id, now, topic_id),
+            )
+            await db.commit()
+
     async def set_tags_last_seen(self, *, topic_id: int, tags: list[str]) -> None:
         now = _now_iso()
         async with aiosqlite.connect(self._path) as db:
@@ -172,6 +189,7 @@ class BotDb:
             discord_channel_id=int(row["discord_channel_id"]),
             discord_message_id=int(row["discord_message_id"]),
             discord_thread_id=int(row["discord_thread_id"]) if row["discord_thread_id"] else None,
+            discord_control_message_id=BotDb._safe_int(row, "discord_control_message_id"),
             claimed_by_user_id=int(row["claimed_by_user_id"]) if row["claimed_by_user_id"] else None,
             tags_last_seen=tags_last_seen,
             tags_last_written=tags_last_written,
@@ -179,3 +197,11 @@ class BotDb:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    @staticmethod
+    def _safe_int(row: Any, key: str) -> int | None:
+        try:
+            value = row[key]
+        except Exception:
+            return None
+        return int(value) if value else None

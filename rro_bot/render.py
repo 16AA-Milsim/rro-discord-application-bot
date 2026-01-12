@@ -28,20 +28,25 @@ def discord_stage_to_discourse_tag(stage: str) -> str:
     return "p-file" if stage.lower() == "accepted" else stage
 
 
-def discourse_tags_to_stage_label(tags: list[str]) -> str:
+def discourse_tags_to_stage_label(tags: list[str], *, icons: dict[str, str] | None = None) -> str:
+    icons = icons or {}
+
+    def icon(name: str, fallback: str) -> str:
+        return icons.get(name) or fallback
+
     tags_set = set(tags)
     if "p-file" in tags_set:
         return "✅ Accepted"
     if "on-hold" in tags_set:
-        return ":yellow_pause: On Hold"
+        return f"{icon('yellow_pause', '⏸️')} On Hold"
     if "interview-held" in tags_set:
-        return ":lime_calendar: Interview Held"
+        return f"{icon('lime_calendar', '🟩📅')} Interview Held"
     if "interview-scheduled" in tags_set:
-        return ":yellow_calendar: Interview Scheduled"
+        return f"{icon('yellow_calendar', '🟨📅')} Interview Scheduled"
     if "letter-sent" in tags_set:
-        return ":orange_letter: Letter Sent"
+        return f"{icon('orange_letter', '🟧✉️')} Letter Sent"
     if "new-application" in tags_set:
-        return ":blue_star: New Application"
+        return f"{icon('blue_star', '🔷')} New Application"
     return "Unknown"
 
 
