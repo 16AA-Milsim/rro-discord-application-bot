@@ -19,7 +19,7 @@ from .render import (
     discourse_tags_to_discord,
     discourse_tags_to_stage_label,
 )
-from .views import ApplicationView, ReassignSelectView
+from .views import ApplicationView
 
 
 log = logging.getLogger("rro_bot")
@@ -40,6 +40,7 @@ class BotService(discord.Client):
     def __init__(self, *, config: BotConfig, db: BotDb, discourse: DiscourseClient):
         intents = discord.Intents.default()
         intents.guilds = True
+        intents.members = True
         super().__init__(intents=intents)
         self.config = config
         self.db = db
@@ -65,6 +66,27 @@ class BotService(discord.Client):
     def _target_ids(self) -> tuple[int, int]:
         return self.config.target_guild_and_channel()
 
+    async def _resolve_claimed_user(self, *, user_id: int | None) -> discord.abc.User | None:
+        if not user_id:
+            return None
+        user = self.get_user(user_id)
+        if user:
+            return user
+        guild_id, _ = self._target_ids()
+        guild = self.get_guild(guild_id)
+        if guild:
+            member = guild.get_member(user_id)
+            if member:
+                return member
+            try:
+                return await guild.fetch_member(user_id)
+            except Exception:
+                return None
+        try:
+            return await self.fetch_user(user_id)
+        except Exception:
+            return None
+
     def _ensure_interaction_in_target(self, interaction: discord.Interaction) -> None:
         target_guild_id, target_channel_id = self._target_ids()
         if not interaction.guild or interaction.guild.id != target_guild_id:
@@ -83,6 +105,67 @@ class BotService(discord.Client):
     def _member_has_admin_permission(self, member: discord.Member) -> bool:
         allowed = {n.lower() for n in self.config.discord_override_role_names}
         return any(role.name.lower() in allowed for role in member.roles)
+
+    def _member_is_claim_eligible(self, member: discord.Member) -> bool:
+        return self._member_has_claim_permission(member)
+
+    async def _build_reassign_options(self) -> list[tuple[int, str]]:
+        guild_id, _ = self._target_ids()
+        guild = self.get_guild(guild_id)
+        if not guild:
+            return []
+
+        eligible: list[tuple[int, str]] = []
+        # Prefer cache, but fall back to fetching if the cache is empty.
+        if guild.members:
+            members = list(guild.members)
+        else:
+            members = []
+            try:
+                async for m in guild.fetch_members(limit=None):
+                    members.append(m)
+            except Exception:
+                members = []
+
+        for m in members:
+            if m.bot:
+                continue
+            if self._member_is_claim_eligible(m):
+                eligible.append((m.id, m.display_name))
+
+        eligible.sort(key=lambda t: t[1].lower())
+        return eligible
+
+    async def _render_for_topic(
+        self,
+        *,
+        topic_id: int,
+        show_reassign_selector: bool = False,
+        claimed_by_override: discord.abc.User | None = None,
+        reassign_options: list[tuple[int, str]] | None = None,
+    ) -> tuple[discord.Embed, ApplicationView]:
+        topic = await self.discourse.fetch_topic(topic_id)
+        tags_discord = discourse_tags_to_discord(topic.tags)
+        stage_label = discourse_tags_to_stage_label(topic.tags)
+
+        record = await self.db.get_application(topic_id)
+        claimed_user = claimed_by_override or await self._resolve_claimed_user(
+            user_id=record.claimed_by_user_id if record else None
+        )
+        view = ApplicationView(
+            topic_id=topic_id,
+            service=self,
+            claimed=bool(record and record.claimed_by_user_id),
+            show_reassign_selector=show_reassign_selector,
+            reassign_options=reassign_options or [],
+        )
+        rendered = build_application_embed(
+            topic=topic,
+            tags_discord=tags_discord,
+            stage_label=stage_label,
+            claimed_by=claimed_user,
+        )
+        return rendered.embed, view
 
     async def handle_discourse_topic_event(self, *, topic_id: int) -> None:
         topic = await self.discourse.fetch_topic(topic_id)
@@ -105,7 +188,7 @@ class BotService(discord.Client):
         claimed_user = None
         claimed = False
         if record and record.claimed_by_user_id:
-            claimed_user = self.get_user(record.claimed_by_user_id)
+            claimed_user = await self._resolve_claimed_user(user_id=record.claimed_by_user_id)
             claimed = True
 
         rendered = build_application_embed(
@@ -207,6 +290,13 @@ class BotService(discord.Client):
         msg = await channel.fetch_message(record.discord_message_id)
         topic = await self.discourse.fetch_topic(topic_id)
 
+        # Update the main message (no ephemeral "Only you can see this" on success).
+        embed, view = await self._render_for_topic(
+            topic_id=topic_id,
+            claimed_by_override=interaction.user,
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
+
         thread_id = await self._create_thread_if_needed(
             message=msg, topic_title=topic.title, topic_id=topic_id
         )
@@ -225,7 +315,6 @@ class BotService(discord.Client):
             )
 
         await self.handle_discourse_topic_event(topic_id=topic_id)
-        await interaction.response.send_message("Claimed and thread opened.", ephemeral=True)
 
     async def handle_unclaim(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
@@ -247,8 +336,9 @@ class BotService(discord.Client):
             await interaction.response.send_message("dry-run: unclaimed in DB.", ephemeral=True)
             return
 
+        embed, view = await self._render_for_topic(topic_id=topic_id)
+        await interaction.response.edit_message(embed=embed, view=view)
         await self.handle_discourse_topic_event(topic_id=topic_id)
-        await interaction.response.send_message("Unclaimed.", ephemeral=True)
 
     async def handle_reassign(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
@@ -265,16 +355,60 @@ class BotService(discord.Client):
             await interaction.response.send_message("Only override roles can reassign.", ephemeral=True)
             return
 
-        await interaction.response.send_message(
-            "Pick the new handler:",
-            view=ReassignSelectView(topic_id=topic_id, service=self),
-            ephemeral=True,
+        # Show a temporary user selector on the main message (avoid ephemeral noise).
+        options = await self._build_reassign_options()
+        embed, view = await self._render_for_topic(
+            topic_id=topic_id,
+            show_reassign_selector=True,
+            reassign_options=options,
         )
+        await interaction.response.edit_message(embed=embed, view=view)
 
     async def handle_force_claim(self, interaction: discord.Interaction, *, topic_id: int, new_user_id: int) -> None:
         await self.db.force_claim(topic_id=topic_id, user_id=new_user_id)
         if not self.config.is_dry_run:
             await self.handle_discourse_topic_event(topic_id=topic_id)
+
+    async def handle_reassign_select(
+        self,
+        interaction: discord.Interaction,
+        *,
+        topic_id: int,
+        new_user_id: int,
+    ) -> None:
+        try:
+            self._ensure_interaction_in_target(interaction)
+        except PermissionError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Unexpected user type.", ephemeral=True)
+            return
+
+        if not self._member_has_admin_permission(interaction.user):
+            await interaction.response.send_message("Only override roles can reassign.", ephemeral=True)
+            return
+
+        guild_id, _ = self._target_ids()
+        guild = self.get_guild(guild_id)
+        if not guild:
+            await interaction.response.send_message("Guild not available.", ephemeral=True)
+            return
+
+        target_member = guild.get_member(new_user_id)
+        if target_member and not self._member_is_claim_eligible(target_member):
+            await interaction.response.send_message(
+                "That user is not eligible (must have RRO or RRO ICs).",
+                ephemeral=True,
+            )
+            return
+
+        await self.db.force_claim(topic_id=topic_id, user_id=new_user_id)
+        await self.handle_discourse_topic_event(topic_id=topic_id)
+
+        embed, view = await self._render_for_topic(topic_id=topic_id, show_reassign_selector=False)
+        await interaction.response.edit_message(embed=embed, view=view)
 
     async def handle_set_stage(self, interaction: discord.Interaction, *, topic_id: int, stage_tag: str) -> None:
         try:
@@ -291,6 +425,9 @@ class BotService(discord.Client):
             await interaction.response.send_message("You do not have permission to change stage.", ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=False)
+
         topic = await self.discourse.fetch_topic(topic_id)
         current = list(topic.tags)
 
@@ -298,7 +435,7 @@ class BotService(discord.Client):
         next_tags = non_stage + [stage_tag]
 
         if self.config.is_dry_run:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"dry-run: would set Discourse tags to: {', '.join(next_tags)}",
                 ephemeral=True,
             )
@@ -307,17 +444,27 @@ class BotService(discord.Client):
         await self.discourse.set_topic_tags(topic_id, next_tags)
         await self.db.set_tags_last_written(topic_id=topic_id, tags=next_tags)
         await self.handle_discourse_topic_event(topic_id=topic_id)
-        await interaction.response.send_message("Stage updated.", ephemeral=True)
+        # Update message without posting extra chatter.
+        try:
+            embed, view = await self._render_for_topic(topic_id=topic_id)
+            await interaction.message.edit(embed=embed, view=view)
+        except Exception:
+            pass
 
 
-def _verify_discourse_signature(*, secret: str, signature: str, raw_body: bytes) -> bool:
-    if not secret:
+def _verify_discourse_signature(*, secrets: tuple[str, ...], signature: str, raw_body: bytes) -> bool:
+    if not secrets:
         return True
     sig = signature.strip()
     if sig.startswith("sha256="):
         sig = sig.split("sha256=", 1)[1].strip()
-    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, expected)
+    for secret in secrets:
+        if not secret:
+            continue
+        expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(sig, expected):
+            return True
+    return False
 
 
 async def create_web_app(*, config: BotConfig, bot: BotService) -> web.Application:
@@ -334,7 +481,12 @@ async def create_web_app(*, config: BotConfig, bot: BotService) -> web.Applicati
             or request.headers.get("X-Discourse-Event-Signature-SHA256", "")
             or request.headers.get("X-Discourse-Signature", "")
         )
-        if not _verify_discourse_signature(secret=config.discourse_webhook_secret, signature=sig, raw_body=raw):
+        if not _verify_discourse_signature(
+            secrets=config.discourse_webhook_secrets,
+            signature=sig,
+            raw_body=raw,
+        ):
+            log.warning("Invalid signature. event=%r remote=%s", event_type, request.remote)
             return web.Response(status=403, text="Invalid signature")
 
         try:

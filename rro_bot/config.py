@@ -44,7 +44,7 @@ class BotConfig:
     discord_override_role_names: tuple[str, ...]
 
     discourse_base_url: str
-    discourse_webhook_secret: str
+    discourse_webhook_secrets: tuple[str, ...]
     discourse_api_key: str
     discourse_api_user: str
 
@@ -76,6 +76,13 @@ class BotConfig:
 
 
 def load_config() -> BotConfig:
+    secrets_raw = os.environ.get("DISCOURSE_WEBHOOK_SECRETS", "").strip()
+    if secrets_raw:
+        discourse_webhook_secrets = tuple(_split_csv(secrets_raw))
+    else:
+        single = os.environ.get("DISCOURSE_WEBHOOK_SECRET", "").strip()
+        discourse_webhook_secrets = (single,) if single else tuple()
+
     return BotConfig(
         discord_bot_token=_get_env("DISCORD_BOT_TOKEN"),
         discord_mode=os.environ.get("DISCORD_MODE", "test").strip(),
@@ -93,7 +100,7 @@ def load_config() -> BotConfig:
             _split_csv(os.environ.get("DISCORD_OVERRIDE_ROLE_NAMES", "RRO ICs,REME Discord"))
         ),
         discourse_base_url=os.environ.get("DISCOURSE_BASE_URL", "https://discourse.16aa.net").rstrip("/"),
-        discourse_webhook_secret=os.environ.get("DISCOURSE_WEBHOOK_SECRET", "").strip(),
+        discourse_webhook_secrets=discourse_webhook_secrets,
         discourse_api_key=os.environ.get("DISCOURSE_API_KEY", "").strip(),
         discourse_api_user=os.environ.get("DISCOURSE_API_USER", "").strip(),
         listen_host=os.environ.get("LISTEN_HOST", "0.0.0.0").strip(),

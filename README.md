@@ -25,6 +25,7 @@ In Discourse Admin → Webhooks:
   - `Topic is updated` (needed for tag updates)
 - Restrict to the Applications category (optional but recommended).
 - Set a webhook secret and configure `DISCOURSE_WEBHOOK_SECRET` in the service.
+  - If you have multiple Discourse webhooks posting to the same Payload URL with different secrets, set `DISCOURSE_WEBHOOK_SECRETS` to a comma-separated list.
 
 ### Configuration (environment variables)
 
@@ -53,6 +54,7 @@ Discourse API (required for Discord → Discourse tag changes; optional for read
 
 - `DISCOURSE_API_KEY`
 - `DISCOURSE_API_USER`
+- `DISCOURSE_WEBHOOK_SECRET` (or `DISCOURSE_WEBHOOK_SECRETS`)
 
 ### Safe testing modes
 
@@ -79,3 +81,4 @@ python .\\bot_service.py
 ### Notes / limitations
 
 - Discord threads always have an auto-archive setting; “no auto-archive” is not supported. This bot sets it to the maximum available.
+- Reassign dropdown needs Discord “Server Members Intent” enabled for the bot so it can list eligible members.

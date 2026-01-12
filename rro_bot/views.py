@@ -5,29 +5,6 @@ import discord
 from .render import discord_stage_to_discourse_tag
 
 
-class ReassignSelectView(discord.ui.View):
-    def __init__(self, *, topic_id: int, service: "BotService"):
-        super().__init__(timeout=60)
-        self.add_item(_ReassignUserSelect(topic_id=topic_id, service=service))
-
-
-class _ReassignUserSelect(discord.ui.UserSelect):
-    def __init__(self, *, topic_id: int, service: "BotService"):
-        super().__init__(
-            placeholder="Select a new handler…",
-            min_values=1,
-            max_values=1,
-            custom_id=f"app_reassign_select:{topic_id}",
-        )
-        self._topic_id = topic_id
-        self._service = service
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        user = self.values[0]
-        await self._service.handle_force_claim(interaction, topic_id=self._topic_id, new_user_id=user.id)
-        await interaction.response.edit_message(content=f"Reassigned to {user.mention}.", view=None)
-
-
 class ApplicationView(discord.ui.View):
     def __init__(
         self,
@@ -35,10 +12,14 @@ class ApplicationView(discord.ui.View):
         topic_id: int,
         service: "BotService",
         claimed: bool,
+        show_reassign_selector: bool = False,
+        reassign_options: list[tuple[int, str]] | None = None,
     ):
         super().__init__(timeout=None)
         self._topic_id = topic_id
         self._service = service
+        self._show_reassign_selector = show_reassign_selector
+        self._reassign_options = reassign_options or []
 
         claim_button = discord.ui.Button(
             label="Claimed" if claimed else "Claim Application",
@@ -67,6 +48,42 @@ class ApplicationView(discord.ui.View):
         reassign_button.callback = self._on_reassign  # type: ignore[assignment]
         self.add_item(reassign_button)
 
+        if self._show_reassign_selector:
+            options = [
+                discord.SelectOption(label=name[:100], value=str(uid))
+                for uid, name in self._reassign_options[:25]
+            ]
+            if options:
+                reassign_select = discord.ui.Select(
+                    placeholder="Reassign to…",
+                    min_values=1,
+                    max_values=1,
+                    options=options,
+                    custom_id=f"app_reassign_select:{topic_id}",
+                    row=2,
+                )
+
+                async def _reassign_select_cb(interaction: discord.Interaction) -> None:
+                    if not reassign_select.values:
+                        await interaction.response.send_message("No user selected.", ephemeral=True)
+                        return
+                    await self._service.handle_reassign_select(
+                        interaction,
+                        topic_id=self._topic_id,
+                        new_user_id=int(reassign_select.values[0]),
+                    )
+
+                reassign_select.callback = _reassign_select_cb  # type: ignore[assignment]
+                self.add_item(reassign_select)
+            else:
+                note = discord.ui.Button(
+                    label="No eligible members found",
+                    style=discord.ButtonStyle.secondary,
+                    disabled=True,
+                    row=2,
+                )
+                self.add_item(note)
+
         stage_select = discord.ui.Select(
             placeholder="Set stage tag…",
             min_values=1,
@@ -80,7 +97,7 @@ class ApplicationView(discord.ui.View):
                 discord.SelectOption(label="Accepted", value="Accepted"),
             ],
             custom_id=f"app_stage_select:{topic_id}",
-            row=2,
+            row=3 if self._show_reassign_selector else 2,
         )
         async def _stage_select_cb(interaction: discord.Interaction) -> None:
             if not stage_select.values:
