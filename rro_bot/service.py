@@ -279,7 +279,7 @@ class BotService(discord.Client):
                         topic_id=topic_id,
                         message=(
                             f"Status (discourse) changed by {actor}: "
-                            f"{prev_stage} → {new_stage}"
+                            f"**{prev_stage}** → **{new_stage}**"
                         ),
                     )
             return
@@ -407,7 +407,7 @@ class BotService(discord.Client):
                 f"{self._discord_ts()} Thread opened.\n"
                 f"Owner: {interaction.user.mention}\n"
                 f"Topic: {topic.url}\n"
-                f"Status: {discourse_tags_to_stage_label(topic.tags)}"
+                f"Status: **{discourse_tags_to_stage_label(topic.tags)}**"
             )
         await self._thread_log(topic_id=topic_id, message=f"Claimed by {interaction.user.mention}.")
 
@@ -559,7 +559,7 @@ class BotService(discord.Client):
         await self.handle_discourse_topic_event(topic_id=topic_id)
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Status (discord) changed by {interaction.user.mention}: {prev_stage} → {new_stage}",
+            message=f"Status (discord) changed by {interaction.user.mention}: **{prev_stage}** → **{new_stage}**",
         )
         # Update message without posting extra chatter.
         try:

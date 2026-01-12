@@ -61,6 +61,7 @@ def build_application_embed(
     stage_label: str,
     claimed_by: discord.abc.User | None,
 ) -> RenderedApplication:
+    owner_value = f"✅ {claimed_by.mention}" if claimed_by else "⚠️ Unassigned"
     embed = discord.Embed(
         title=topic.title or "New application",
         url=topic.url,
@@ -70,7 +71,7 @@ def build_application_embed(
     embed.add_field(name="Status", value=stage_label, inline=False)
     embed.add_field(
         name="Owner",
-        value=claimed_by.mention if claimed_by else "Unassigned",
+        value=owner_value,
         inline=False,
     )
     return RenderedApplication(embed=embed)
