@@ -31,17 +31,17 @@ def discord_stage_to_discourse_tag(stage: str) -> str:
 def discourse_tags_to_stage_label(tags: list[str]) -> str:
     tags_set = set(tags)
     if "p-file" in tags_set:
-        return "Accepted"
+        return "✅ Accepted"
     if "on-hold" in tags_set:
-        return "On Hold"
+        return "🟨 On Hold"
     if "interview-held" in tags_set:
-        return "Interview Held"
+        return "🟩📅 Interview Held"
     if "interview-scheduled" in tags_set:
-        return "Interview Scheduled"
+        return "🟨📅 Interview Scheduled"
     if "letter-sent" in tags_set:
-        return "Letter Sent"
+        return "🟧✉️ Letter Sent"
     if "new-application" in tags_set:
-        return "New Application"
+        return "🔷 New Application"
     return "Unknown"
 
 
@@ -63,7 +63,7 @@ def build_application_embed(
 ) -> RenderedApplication:
     owner_value = f"✅ {claimed_by.mention}" if claimed_by else "⚠️ Unassigned"
     embed = discord.Embed(
-        title=topic.title or "New application",
+        title=f"📄 {topic.title}" if topic.title else "📄 New application",
         url=topic.url,
         description=f"Submitted by **{topic.author}**",
         color=0x940039,
