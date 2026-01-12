@@ -33,15 +33,15 @@ def discourse_tags_to_stage_label(tags: list[str]) -> str:
     if "p-file" in tags_set:
         return "✅ Accepted"
     if "on-hold" in tags_set:
-        return "🟨 On Hold"
+        return ":yellow_pause: On Hold"
     if "interview-held" in tags_set:
-        return "🟩📅 Interview Held"
+        return ":lime_calendar: Interview Held"
     if "interview-scheduled" in tags_set:
-        return "🟨📅 Interview Scheduled"
+        return ":yellow_calendar: Interview Scheduled"
     if "letter-sent" in tags_set:
-        return "🟧✉️ Letter Sent"
+        return ":orange_letter: Letter Sent"
     if "new-application" in tags_set:
-        return "🔷 New Application"
+        return ":blue_star: New Application"
     return "Unknown"
 
 
@@ -61,7 +61,7 @@ def build_application_embed(
     stage_label: str,
     claimed_by: discord.abc.User | None,
 ) -> RenderedApplication:
-    owner_value = f"✅ {claimed_by.mention}" if claimed_by else "⚠️ Unassigned"
+    owner_value = claimed_by.mention if claimed_by else "⚠️ Unassigned"
     embed = discord.Embed(
         title=f"📄 {topic.title}" if topic.title else "📄 New application",
         url=topic.url,
