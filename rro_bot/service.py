@@ -24,6 +24,17 @@ from .views import ApplicationView, ReassignSelectView
 
 log = logging.getLogger("rro_bot")
 
+def _log_task_exceptions(task: asyncio.Task) -> None:
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("Background task error")
+        return
+    if exc:
+        log.exception("Background task error", exc_info=exc)
+
 
 class BotService(discord.Client):
     def __init__(self, *, config: BotConfig, db: BotDb, discourse: DiscourseClient):
@@ -329,7 +340,8 @@ async def create_web_app(*, config: BotConfig, bot: BotService) -> web.Applicati
         except Exception:
             return web.Response(status=200, text="Ignored (no topic id)")
 
-        asyncio.create_task(bot.handle_discourse_topic_event(topic_id=topic_id_int))
+        task = asyncio.create_task(bot.handle_discourse_topic_event(topic_id=topic_id_int))
+        task.add_done_callback(_log_task_exceptions)
         return web.Response(status=200, text="OK")
 
     app.router.add_get("/health", health)

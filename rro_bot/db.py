@@ -91,10 +91,11 @@ class BotDb:
     async def get_application(self, topic_id: int) -> ApplicationRecord | None:
         async with aiosqlite.connect(self._path) as db:
             db.row_factory = aiosqlite.Row
-            row = await db.execute_fetchone(
+            async with db.execute(
                 "SELECT * FROM applications WHERE topic_id=?",
                 (topic_id,),
-            )
+            ) as cur:
+                row = await cur.fetchone()
             if not row:
                 return None
             return self._row_to_record(row)
@@ -102,8 +103,9 @@ class BotDb:
     async def list_applications(self) -> list[ApplicationRecord]:
         async with aiosqlite.connect(self._path) as db:
             db.row_factory = aiosqlite.Row
-            rows = await db.execute_fetchall("SELECT * FROM applications")
-            return [self._row_to_record(r) for r in rows]
+            async with db.execute("SELECT * FROM applications") as cur:
+                rows = await cur.fetchall()
+                return [self._row_to_record(r) for r in rows]
 
     async def try_claim(self, *, topic_id: int, user_id: int) -> bool:
         now = _now_iso()
@@ -177,4 +179,3 @@ class BotDb:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
-
