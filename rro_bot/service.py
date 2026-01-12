@@ -114,6 +114,13 @@ class BotService(discord.Client):
         except Exception:
             log.exception("Failed to send thread log (topic_id=%s)", topic_id)
 
+    @staticmethod
+    def _stage_tag_from_discourse_tags(tags: list[str]) -> str:
+        for t in tags:
+            if t in STAGE_TAGS_DISCOURSE:
+                return "Accepted" if t == "p-file" else t
+        return "(none)"
+
     def _ensure_interaction_in_target(self, interaction: discord.Interaction) -> None:
         target_guild_id, target_channel_id = self._target_ids()
         if not interaction.guild or interaction.guild.id != target_guild_id:
@@ -192,7 +199,13 @@ class BotService(discord.Client):
         )
         return rendered.embed, view
 
-    async def handle_discourse_topic_event(self, *, topic_id: int, event_type: str = "") -> None:
+    async def handle_discourse_topic_event(
+        self,
+        *,
+        topic_id: int,
+        event_type: str = "",
+        discourse_actor: str | None = None,
+    ) -> None:
         topic = await self.discourse.fetch_topic(topic_id)
         if topic.category_id != self.config.applications_category_id:
             return
@@ -241,12 +254,14 @@ class BotService(discord.Client):
                     and sorted(record.tags_last_written) == sorted(topic.tags)
                 )
                 if not suppress_echo:
+                    prev_stage = self._stage_tag_from_discourse_tags(previous_tags)
+                    new_stage = self._stage_tag_from_discourse_tags(topic.tags)
+                    actor = discourse_actor or "Unknown"
                     await self._thread_log(
                         topic_id=topic_id,
                         message=(
-                            f"Discourse update ({event_type or 'topic'}): "
-                            f"tags `{', '.join(discourse_tags_to_discord(previous_tags)) or '(none)'}` "
-                            f"→ `{', '.join(discourse_tags_to_discord(topic.tags)) or '(none)'}`"
+                            f"Status (discourse) changed by {actor}: "
+                            f"{prev_stage} → {new_stage}"
                         ),
                     )
             return
@@ -269,7 +284,14 @@ class BotService(discord.Client):
             tags_last_seen=topic.tags,
         )
 
-    async def _create_thread_if_needed(self, *, message: discord.Message, topic_title: str, topic_id: int) -> int:
+    async def _create_thread_if_needed(
+        self,
+        *,
+        channel: discord.TextChannel,
+        message: discord.Message,
+        topic_title: str,
+        topic_id: int,
+    ) -> int:
         record = await self.db.get_application(topic_id)
         if record and record.discord_thread_id:
             return record.discord_thread_id
@@ -283,13 +305,27 @@ class BotService(discord.Client):
         last_error: Exception | None = None
         for duration in archive_options:
             try:
-                thread = await message.create_thread(
+                # Prefer creating a thread without a parent message so the non-clickable
+                # component preview isn't shown at the top of the thread.
+                thread = await channel.create_thread(
                     name=thread_name,
                     auto_archive_duration=duration,
+                    type=discord.ChannelType.public_thread,
                 )
                 break
             except Exception as e:
                 last_error = e
+                # Fall back to creating from the message if the guild/channel disallows
+                # threads without a parent message.
+                try:
+                    thread = await message.create_thread(
+                        name=thread_name,
+                        auto_archive_duration=duration,
+                    )
+                    last_error = None
+                    break
+                except Exception as e2:
+                    last_error = e2
         else:
             raise last_error or RuntimeError("Failed to create thread")
 
@@ -341,7 +377,10 @@ class BotService(discord.Client):
         await interaction.response.edit_message(embed=embed, view=view)
 
         thread_id = await self._create_thread_if_needed(
-            message=msg, topic_title=topic.title, topic_id=topic_id
+            channel=channel,
+            message=msg,
+            topic_title=topic.title,
+            topic_id=topic_id,
         )
         _ = thread_id
         thread = await self._get_thread_for_topic(topic_id=topic_id)
@@ -350,7 +389,7 @@ class BotService(discord.Client):
                 f"{self._discord_ts()} Thread opened.\n"
                 f"Handler: {interaction.user.mention}\n"
                 f"Topic: {topic.url}\n"
-                f"Tags: {', '.join(discourse_tags_to_discord(topic.tags)) or '(none)'}"
+                f"Status: {discourse_tags_to_stage_label(topic.tags)}"
             )
         await self._thread_log(topic_id=topic_id, message=f"Claimed by {interaction.user.mention}.")
 
@@ -484,9 +523,11 @@ class BotService(discord.Client):
 
         topic = await self.discourse.fetch_topic(topic_id)
         current = list(topic.tags)
+        prev_stage = self._stage_tag_from_discourse_tags(current)
 
         non_stage = [t for t in current if t not in STAGE_TAGS_DISCOURSE]
         next_tags = non_stage + [stage_tag]
+        new_stage = "Accepted" if stage_tag == "p-file" else stage_tag
 
         if self.config.is_dry_run:
             await interaction.followup.send(
@@ -500,7 +541,7 @@ class BotService(discord.Client):
         await self.handle_discourse_topic_event(topic_id=topic_id)
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Stage set by {interaction.user.mention}: `{stage_tag if stage_tag != 'p-file' else 'Accepted'}`.",
+            message=f"Status (discord) changed by {interaction.user.mention}: {prev_stage} → {new_stage}",
         )
         # Update message without posting extra chatter.
         try:
@@ -563,8 +604,23 @@ async def create_web_app(*, config: BotConfig, bot: BotService) -> web.Applicati
             log.info("Ignored webhook (no topic id). event=%r keys=%s", event_type, list(payload.keys()))
             return web.Response(status=200, text="Ignored (no topic id)")
 
+        discourse_actor = None
+        actor_obj = payload.get("user")
+        if isinstance(actor_obj, dict):
+            discourse_actor = actor_obj.get("username") or actor_obj.get("name")
+        if not discourse_actor and isinstance(topic, dict):
+            last_poster = topic.get("last_poster")
+            if isinstance(last_poster, dict):
+                discourse_actor = last_poster.get("username") or last_poster.get("name")
+
         log.info("Webhook received. event=%r topic_id=%s", event_type, topic_id_int)
-        task = asyncio.create_task(bot.handle_discourse_topic_event(topic_id=topic_id_int, event_type=event_type))
+        task = asyncio.create_task(
+            bot.handle_discourse_topic_event(
+                topic_id=topic_id_int,
+                event_type=event_type,
+                discourse_actor=discourse_actor,
+            )
+        )
         task.add_done_callback(_log_task_exceptions)
         return web.Response(status=200, text="OK")
 
