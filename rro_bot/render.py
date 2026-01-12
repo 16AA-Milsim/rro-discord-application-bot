@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import discord
+
+from .discourse import DiscourseTopic
+
+
+STAGE_TAGS_DISCOURSE = (
+    "new-application",
+    "letter-sent",
+    "interview-scheduled",
+    "interview-held",
+    "on-hold",
+    "p-file",
+)
+
+
+def discourse_tags_to_discord(tags: list[str]) -> list[str]:
+    out: list[str] = []
+    for t in tags:
+        out.append("Accepted" if t == "p-file" else t)
+    return out
+
+
+def discord_stage_to_discourse_tag(stage: str) -> str:
+    return "p-file" if stage.lower() == "accepted" else stage
+
+
+def discourse_tags_to_stage_label(tags: list[str]) -> str:
+    tags_set = set(tags)
+    if "p-file" in tags_set:
+        return "Accepted"
+    if "on-hold" in tags_set:
+        return "On Hold"
+    if "interview-held" in tags_set:
+        return "Interview Held"
+    if "interview-scheduled" in tags_set:
+        return "Interview Scheduled"
+    if "letter-sent" in tags_set:
+        return "Letter Sent"
+    if "new-application" in tags_set:
+        return "New Application"
+    return "Unknown"
+
+
+def format_tag_list(tags: list[str]) -> str:
+    return ", ".join(tags) if tags else "(none)"
+
+
+@dataclass(frozen=True)
+class RenderedApplication:
+    embed: discord.Embed
+
+
+def build_application_embed(
+    *,
+    topic: DiscourseTopic,
+    tags_discord: list[str],
+    stage_label: str,
+    claimed_by: discord.abc.User | None,
+) -> RenderedApplication:
+    embed = discord.Embed(
+        title=topic.title or "New application",
+        url=topic.url,
+        description=f"Submitted by **{topic.author}**",
+        color=0x940039,
+    )
+    embed.add_field(name="Stage", value=stage_label, inline=True)
+    embed.add_field(name="Tags", value=format_tag_list(tags_discord), inline=False)
+    embed.add_field(
+        name="Claim",
+        value=f"Claimed by {claimed_by.mention}" if claimed_by else "Unclaimed",
+        inline=True,
+    )
+    embed.set_footer(text="Discourse → RRO Applications")
+    return RenderedApplication(embed=embed)
+

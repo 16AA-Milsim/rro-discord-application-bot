@@ -6,6 +6,12 @@ venv/
 
 # Environment / secrets
 .env
+.env.*
+!.env.example
+!.env.test.template
+
+# Local state
+bot.db
 
 # Logs
 *.log
