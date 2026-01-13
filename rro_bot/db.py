@@ -24,6 +24,7 @@ class ApplicationRecord:
     tags_last_written: list[str] | None
     tags_written_at: str | None
     accepted_at: str | None
+    archive_status: str | None
     archive_scheduled_at: str | None
     archived_at: str | None
     created_at: str
@@ -49,6 +50,7 @@ class BotDb:
                     tags_last_written TEXT,
                     tags_written_at TEXT,
                     accepted_at TEXT,
+                    archive_status TEXT,
                     archive_scheduled_at TEXT,
                     archived_at TEXT,
                     created_at TEXT NOT NULL,
@@ -73,6 +75,10 @@ class BotDb:
                 await db.execute("ALTER TABLE applications ADD COLUMN archived_at TEXT")
             except Exception:
                 pass
+            try:
+                await db.execute("ALTER TABLE applications ADD COLUMN archive_status TEXT")
+            except Exception:
+                pass
             await db.commit()
 
     async def upsert_application(
@@ -92,10 +98,10 @@ class BotDb:
                     topic_id, discord_channel_id, discord_message_id, discord_thread_id,
                     discord_control_message_id,
                     claimed_by_user_id, tags_last_seen, tags_last_written, tags_written_at,
-                    accepted_at, archive_scheduled_at, archived_at,
+                    accepted_at, archive_status, archive_scheduled_at, archived_at,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
                 ON CONFLICT(topic_id) DO UPDATE SET
                     discord_channel_id=excluded.discord_channel_id,
                     discord_message_id=excluded.discord_message_id,
@@ -206,6 +212,15 @@ class BotDb:
             )
             await db.commit()
 
+    async def set_archive_status(self, *, topic_id: int, status: str | None) -> None:
+        now = _now_iso()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                "UPDATE applications SET archive_status=?, updated_at=? WHERE topic_id=?",
+                (status, now, topic_id),
+            )
+            await db.commit()
+
     async def schedule_archive(self, *, topic_id: int, when_iso: str | None) -> None:
         now = _now_iso()
         async with aiosqlite.connect(self._path) as db:
@@ -241,6 +256,7 @@ class BotDb:
             tags_last_written=tags_last_written,
             tags_written_at=row["tags_written_at"],
             accepted_at=row["accepted_at"] if "accepted_at" in row.keys() else None,
+            archive_status=row["archive_status"] if "archive_status" in row.keys() else None,
             archive_scheduled_at=row["archive_scheduled_at"] if "archive_scheduled_at" in row.keys() else None,
             archived_at=row["archived_at"] if "archived_at" in row.keys() else None,
             created_at=row["created_at"],

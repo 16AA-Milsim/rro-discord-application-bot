@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -102,9 +103,29 @@ class BotService(discord.Client):
         self._archive_tasks[topic_id] = asyncio.create_task(_runner())
 
     def _cancel_archive(self, *, topic_id: int) -> None:
-        task = self._archive_tasks.get(topic_id)
+        task = self._archive_tasks.pop(topic_id, None)
         if task and not task.done():
             task.cancel()
+
+    def _accepted_archive_delay_minutes(self) -> int:
+        return max(0, self.config.accepted_archive_delay_minutes)
+
+    def _accepted_archive_delay_seconds(self) -> float:
+        return float(self._accepted_archive_delay_minutes()) * 60.0
+
+    def _accepted_archive_message(self) -> str:
+        minutes = self._accepted_archive_delay_minutes()
+        if minutes <= 0:
+            return "Accepted. Archiving now."
+        unit = "minute" if minutes == 1 else "minutes"
+        return f"Accepted. Archiving in {minutes} {unit} (you can revert status until then)."
+
+    def _rejected_archive_message(self) -> str:
+        minutes = self._accepted_archive_delay_minutes()
+        if minutes <= 0:
+            return "Rejected. Archiving now."
+        unit = "minute" if minutes == 1 else "minutes"
+        return f"Rejected. Archiving in {minutes} {unit} (you can revert status until then)."
 
     async def _archive_topic_if_accepted(self, *, topic_id: int) -> None:
         record = await self.db.get_application(topic_id)
@@ -112,19 +133,22 @@ class BotService(discord.Client):
             return
 
         topic = await self.discourse.fetch_topic(topic_id)
-        if not self._is_accepted(topic.tags):
+        archive_status = record.archive_status
+        if archive_status != "rejected" and not self._is_accepted(topic.tags):
             await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
             return
 
         notify_msg = await self._get_notify_message(topic_id=topic_id)
+        parent_channel = self.get_channel(record.discord_channel_id)
+        if not isinstance(parent_channel, discord.TextChannel):
+            parent_channel = None
 
         # Ensure we have a thread; if acceptance happened without a claim/thread, create one.
         thread = await self._get_thread_for_topic(topic_id=topic_id)
         if thread is None and notify_msg:
-            channel = self.get_channel(record.discord_channel_id)
-            if isinstance(channel, discord.TextChannel):
+            if parent_channel:
                 _ = await self._create_thread_if_needed(
-                    channel=channel,
+                    channel=parent_channel,
                     message=notify_msg,
                     topic_title=topic.title,
                     topic_id=topic_id,
@@ -135,16 +159,6 @@ class BotService(discord.Client):
         if thread:
             guild_id, _ = self._target_ids()
             thread_link = f"https://discord.com/channels/{guild_id}/{thread.id}"
-
-        # Main channel: keep a minimal Accepted stub, remove controls.
-        if notify_msg:
-            embed, _view = await self._render_for_topic(topic_id=topic_id)
-            embed.add_field(
-                name="Archive",
-                value=f"[Open thread]({thread_link})" if thread_link else "Thread not available",
-                inline=False,
-            )
-            await notify_msg.edit(embed=embed, view=None)
 
         # Thread: disable controls and lock/archive.
         if thread and record.discord_control_message_id:
@@ -160,8 +174,12 @@ class BotService(discord.Client):
             except Exception:
                 pass
 
-        # Optional: post summary in archive channel.
+        # Optional: post summary and transcript thread in archive channel.
+        archive_posted = False
+        transcript_sent = False
+        archive_thread: discord.Thread | None = None
         archive_channel_id = self.config.target_archive_channel_id()
+        archive_channel: discord.TextChannel | None = None
         if archive_channel_id:
             archive_channel = self.get_channel(archive_channel_id)
             if archive_channel is None:
@@ -171,16 +189,99 @@ class BotService(discord.Client):
                     archive_channel = None
             if isinstance(archive_channel, discord.TextChannel):
                 owner = await self._resolve_claimed_user(user_id=record.claimed_by_user_id)
-                status = discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())
+                if archive_status == "rejected":
+                    status = "❌ Rejected"
+                else:
+                    status = discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())
                 embed = discord.Embed(
-                    title=f"📄 {topic.title}",
+                    title=topic.title or "Application",
                     url=topic.url,
                     color=0x2ecc71,
-                    description=f"Owner: {owner.mention if owner else '⚠️ Unassigned'}\nStatus: {status}",
+                    description=f"Owner: {self._user_label(owner)}\nStatus: {status}",
                 )
-                if thread_link:
-                    embed.add_field(name="Thread", value=f"[Open]({thread_link})", inline=False)
-                await archive_channel.send(content="✅ Accepted (Archived)", embed=embed)
+                try:
+                    archive_label = "Rejected (Archived)" if archive_status == "rejected" else "Accepted (Archived)"
+                    archive_msg = await archive_channel.send(content=archive_label, embed=embed)
+                    archive_posted = True
+                    log.info(
+                        "Archive summary posted (topic_id=%s channel_id=%s message_id=%s)",
+                        topic_id,
+                        archive_channel.id,
+                        archive_msg.id,
+                    )
+                    archive_thread = await self._create_archive_thread(
+                        message=archive_msg,
+                        topic_title=topic.title,
+                    )
+                    log.info(
+                        "Archive thread created (topic_id=%s thread_id=%s)",
+                        topic_id,
+                        archive_thread.id,
+                    )
+                except Exception:
+                    log.exception("Failed to post archive summary (topic_id=%s)", topic_id)
+
+                if archive_thread:
+                    if thread:
+                        try:
+                            await archive_thread.send("Thread log:")
+                            messages_sent = await self._send_transcript_to_thread(
+                                source_thread=thread,
+                                dest_thread=archive_thread,
+                            )
+                            log.info(
+                                "Archive transcript sent (topic_id=%s messages=%s)",
+                                topic_id,
+                                messages_sent,
+                            )
+                            transcript_sent = True
+                        except Exception:
+                            log.exception("Failed to export thread transcript (topic_id=%s)", topic_id)
+                    else:
+                        try:
+                            await archive_thread.send("No source thread was available.")
+                            transcript_sent = True
+                        except Exception:
+                            pass
+                elif archive_posted:
+                    log.warning(
+                        "Archive thread missing (topic_id=%s channel_id=%s)",
+                        topic_id,
+                        archive_channel.id,
+                    )
+
+        # Main channel: remove the application card once the archive summary and transcript are posted.
+        if archive_posted and transcript_sent and notify_msg:
+            try:
+                await notify_msg.delete()
+                notify_msg = None
+            except discord.NotFound:
+                notify_msg = None
+            except Exception:
+                log.exception("Failed to delete archived notification (topic_id=%s)", topic_id)
+
+        # Fallback: keep a minimal Accepted stub if we did not delete the message.
+        if notify_msg:
+            try:
+                embed, _view = await self._render_for_topic(topic_id=topic_id)
+                embed.add_field(
+                    name="Archive",
+                    value=f"[Open thread]({thread_link})" if thread_link else "Thread not available",
+                    inline=False,
+                )
+                await notify_msg.edit(embed=embed, view=None)
+            except discord.NotFound:
+                pass
+            except Exception:
+                log.exception("Failed to update archived notification (topic_id=%s)", topic_id)
+
+        if transcript_sent and archive_posted and thread:
+            try:
+                await thread.delete()
+            except Exception:
+                log.exception("Failed to delete archived thread (topic_id=%s)", topic_id)
+            if parent_channel:
+                await self._delete_thread_system_message(channel=parent_channel, thread=thread)
 
         await self.db.mark_archived(topic_id=topic_id, archived=True)
         await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
@@ -218,6 +319,98 @@ class BotService(discord.Client):
             return await self.fetch_user(user_id)
         except Exception:
             return None
+
+    @staticmethod
+    def _user_label(user: discord.abc.User | None) -> str:
+        if not user:
+            return "Unassigned"
+        display_name = getattr(user, "display_name", None) or user.name
+        username = getattr(user, "name", "")
+        if username and display_name != username:
+            return f"{display_name} ({username})"
+        return display_name
+
+    async def _respond_ephemeral(self, interaction: discord.Interaction, message: str) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+    async def _defer_interaction(
+        self,
+        interaction: discord.Interaction,
+        *,
+        thinking: bool = False,
+        ephemeral: bool = False,
+    ) -> bool:
+        if interaction.response.is_done():
+            return False
+        await interaction.response.defer(thinking=thinking, ephemeral=ephemeral)
+        return True
+
+    async def _finish_interaction(
+        self,
+        interaction: discord.Interaction,
+        *,
+        deferred: bool,
+        message: str | None = None,
+    ) -> None:
+        if deferred:
+            return
+        if message:
+            try:
+                await interaction.followup.send(message, ephemeral=True, delete_after=6)
+            except Exception:
+                pass
+
+    def _format_transcript_line(self, msg: discord.Message) -> str:
+        author = getattr(msg.author, "display_name", msg.author.name)
+        timestamp = msg.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        content = msg.content or ""
+        if msg.attachments:
+            attachments = " ".join(a.url for a in msg.attachments)
+            if content:
+                content += " "
+            content += f"[attachments: {attachments}]"
+        if msg.embeds:
+            if content:
+                content += " "
+            content += "[embeds]"
+        if not content:
+            content = "(no content)"
+
+        is_bot = bool(self.user and msg.author.id == self.user.id)
+        if is_bot:
+            match = re.match(r"^<t:\d+(?::[a-zA-Z])?>\s*", content)
+            if match:
+                content = content[match.end():]
+            return f"[{timestamp} UTC] {content}"
+
+        return f"[{timestamp} UTC] {author}: {content}"
+
+    async def _send_transcript_to_thread(
+        self,
+        *,
+        source_thread: discord.Thread,
+        dest_thread: discord.Thread,
+    ) -> int:
+        max_len = 1900
+        buffer = ""
+        messages_sent = 0
+        async for msg in source_thread.history(limit=None, oldest_first=True):
+            line = self._format_transcript_line(msg)
+            if len(line) > max_len:
+                line = line[: max_len - 3] + "..."
+            if buffer and len(buffer) + 1 + len(line) > max_len:
+                await dest_thread.send(buffer)
+                messages_sent += 1
+                buffer = line
+            else:
+                buffer = line if not buffer else f"{buffer}\n{line}"
+        if buffer:
+            await dest_thread.send(buffer)
+            messages_sent += 1
+        return messages_sent
 
     @staticmethod
     def _discord_ts() -> str:
@@ -370,6 +563,8 @@ class BotService(discord.Client):
         stage_label = discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())
 
         record = await self.db.get_application(topic_id)
+        if record and record.archive_status == "rejected":
+            stage_label = "Rejected"
         claimed_user = claimed_by_override or await self._resolve_claimed_user(
             user_id=record.claimed_by_user_id if record else None
         )
@@ -429,6 +624,9 @@ class BotService(discord.Client):
             raise RuntimeError(f"Channel not found or not a text channel: {target_channel_id}")
 
         record = await self.db.get_application(topic_id)
+        if record and record.archived_at:
+            log.info("Ignored webhook for archived topic_id=%s", topic_id)
+            return
         previous_tags = list(record.tags_last_seen) if record else None
         claimed_user = None
         claimed = False
@@ -453,43 +651,54 @@ class BotService(discord.Client):
             await self.db.set_tags_last_seen(topic_id=topic_id, tags=topic.tags)
             await self._ensure_thread_controls(topic_id=topic_id)
 
-            # Schedule delayed archive when Accepted arrives from Discourse.
-            if previous_tags is not None:
-                became_accepted = (not self._is_accepted(previous_tags)) and self._is_accepted(topic.tags)
-                reopened = self._is_accepted(previous_tags) and (not self._is_accepted(topic.tags))
-                if became_accepted:
-                    when = datetime.now(timezone.utc) + timedelta(minutes=30)
-                    await self.db.mark_accepted(topic_id=topic_id, accepted=True)
-                    await self.db.schedule_archive(topic_id=topic_id, when_iso=when.isoformat())
-                    self._schedule_archive(topic_id=topic_id, delay_seconds=30 * 60, reason="discourse-accepted")
-                    await self._thread_log(
-                        topic_id=topic_id,
-                        message="Accepted. Archiving in 30 minutes (you can revert status until then).",
-                    )
-                elif reopened:
-                    await self.db.mark_accepted(topic_id=topic_id, accepted=False)
-                    await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
-                    self._cancel_archive(topic_id=topic_id)
-                    await self._thread_log(topic_id=topic_id, message="Reopened (Accepted removed).")
-
-            # If Discourse tags changed, log it in the thread (if one exists), unless it matches
-            # tags we just wrote from Discord (to avoid duplicate "echo" logs).
+            suppress_echo = False
             if previous_tags is not None and previous_tags != topic.tags:
                 suppress_echo = bool(
                     record.tags_last_written is not None
                     and sorted(record.tags_last_written) == sorted(topic.tags)
                 )
-                if not suppress_echo:
-                    prev_stage = self._stage_tag_from_discourse_tags(previous_tags)
-                    new_stage = self._stage_tag_from_discourse_tags(topic.tags)
-                    actor = discourse_actor or "Unknown"
-                    await self._thread_log(
-                        topic_id=topic_id,
-                        message=(
-                            f"Status (discourse) changed by {actor}: "
-                            f"**{prev_stage}** -> **{new_stage}**"
-                        ),
-                    )
+
+            # Schedule delayed archive when Accepted arrives from Discourse.
+            if previous_tags is not None:
+                ignore_reopen_for_reject = bool(record.archive_status == "rejected" and suppress_echo)
+                if not ignore_reopen_for_reject and not suppress_echo:
+                    became_accepted = (not self._is_accepted(previous_tags)) and self._is_accepted(topic.tags)
+                    reopened = self._is_accepted(previous_tags) and (not self._is_accepted(topic.tags))
+                    if became_accepted:
+                        delay_minutes = self._accepted_archive_delay_minutes()
+                        when = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
+                        await self.db.mark_accepted(topic_id=topic_id, accepted=True)
+                        await self.db.set_archive_status(topic_id=topic_id, status="accepted")
+                        await self.db.schedule_archive(topic_id=topic_id, when_iso=when.isoformat())
+                        self._schedule_archive(
+                            topic_id=topic_id,
+                            delay_seconds=self._accepted_archive_delay_seconds(),
+                            reason="discourse-accepted",
+                        )
+                        await self._thread_log(
+                            topic_id=topic_id,
+                            message=self._accepted_archive_message(),
+                        )
+                    elif reopened:
+                        await self.db.mark_accepted(topic_id=topic_id, accepted=False)
+                        await self.db.set_archive_status(topic_id=topic_id, status=None)
+                        await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
+                        self._cancel_archive(topic_id=topic_id)
+                        await self._thread_log(topic_id=topic_id, message="Reopened (Accepted removed).")
+
+            # If Discourse tags changed, log it in the thread (if one exists), unless it matches
+            # tags we just wrote from Discord (to avoid duplicate "echo" logs).
+            if previous_tags is not None and previous_tags != topic.tags and not suppress_echo:
+                prev_stage = self._stage_tag_from_discourse_tags(previous_tags)
+                new_stage = self._stage_tag_from_discourse_tags(topic.tags)
+                actor = discourse_actor or "Unknown"
+                await self._thread_log(
+                    topic_id=topic_id,
+                    message=(
+                        f"Status (discourse) changed by {actor}: "
+                        f"**{prev_stage}** -> **{new_stage}**"
+                    ),
+                )
             return
 
         if self.config.is_dry_run:
@@ -511,10 +720,16 @@ class BotService(discord.Client):
         )
 
         if self._is_accepted(topic.tags):
-            when = datetime.now(timezone.utc) + timedelta(minutes=30)
+            delay_minutes = self._accepted_archive_delay_minutes()
+            when = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
             await self.db.mark_accepted(topic_id=topic_id, accepted=True)
+            await self.db.set_archive_status(topic_id=topic_id, status="accepted")
             await self.db.schedule_archive(topic_id=topic_id, when_iso=when.isoformat())
-            self._schedule_archive(topic_id=topic_id, delay_seconds=30 * 60, reason="discourse-accepted-initial")
+            self._schedule_archive(
+                topic_id=topic_id,
+                delay_seconds=self._accepted_archive_delay_seconds(),
+                reason="discourse-accepted-initial",
+            )
 
     async def _create_thread_if_needed(
         self,
@@ -564,59 +779,105 @@ class BotService(discord.Client):
         await self.db.set_thread_id(topic_id=topic_id, thread_id=thread.id)
         return thread.id
 
+    async def _create_archive_thread(
+        self,
+        *,
+        message: discord.Message,
+        topic_title: str,
+    ) -> discord.Thread:
+        base_name = f"Application - {topic_title}".strip()
+        thread_name = base_name[:100] if len(base_name) > 100 else base_name
+        archive_options = (10080, 4320, 1440)
+        last_error: Exception | None = None
+        for duration in archive_options:
+            try:
+                return await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=duration,
+                )
+            except Exception as e:
+                last_error = e
+        raise last_error or RuntimeError("Failed to create archive thread")
+
+    async def _delete_thread_system_message(
+        self,
+        *,
+        channel: discord.TextChannel,
+        thread: discord.Thread,
+    ) -> None:
+        try:
+            async for msg in channel.history(limit=50):
+                if msg.type == discord.MessageType.thread_created:
+                    msg_thread = getattr(msg, "thread", None)
+                    if msg_thread and msg_thread.id == thread.id:
+                        await msg.delete()
+                        return
+                    if thread.name and thread.name in msg.content:
+                        await msg.delete()
+                        return
+        except Exception:
+            log.exception("Failed to delete thread system message (thread_id=%s)", thread.id)
+
     async def handle_claim(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
             await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await self._respond_ephemeral(interaction, str(e))
             return
 
         if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Unexpected user type.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Unexpected user type.")
             return
 
         if not self._member_has_claim_permission(interaction.user):
-            await interaction.response.send_message("Only RRO can claim applications.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Only RRO can claim applications.")
             return
 
         ok = await self.db.try_claim(topic_id=topic_id, user_id=interaction.user.id)
         if not ok:
-            await interaction.response.send_message("This application is already claimed.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "This application is already claimed.")
             return
 
         if self.config.is_dry_run:
-            await interaction.response.send_message("dry-run: claim recorded; no Discord updates.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "dry-run: claim recorded; no Discord updates.")
             return
+
+        processing_view = ApplicationView(
+            topic_id=topic_id,
+            service=self,
+            claimed=False,
+            processing=True,
+            processing_label="Claiming...",
+        )
+        responded = False
+        if interaction.message:
+            try:
+                await interaction.response.edit_message(view=processing_view)
+                responded = True
+            except Exception:
+                responded = False
+        deferred = False if responded else await self._defer_interaction(interaction)
 
         record = await self.db.get_application(topic_id)
         if not record:
-            await interaction.response.send_message("Internal error: missing record.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Internal error: missing record.")
             return
         had_thread = bool(record.discord_thread_id)
 
         channel = self.get_channel(record.discord_channel_id)
         if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("Internal error: channel missing.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Internal error: channel missing.")
             return
 
         msg = await channel.fetch_message(record.discord_message_id)
         topic = await self.discourse.fetch_topic(topic_id)
-
-        # Update the main message (no ephemeral "Only you can see this" on success).
-        embed, view = await self._render_for_topic(
-            topic_id=topic_id,
-            claimed_by_override=interaction.user,
-        )
-        notify_msg = await self._get_notify_message(topic_id=topic_id)
-        if notify_msg:
-            await notify_msg.edit(embed=embed, view=view)
-
-        # If the interaction happened on the notification message itself, respond by editing it.
-        # Otherwise, defer to avoid an ephemeral "Only you can see this" success message.
-        if interaction.message and interaction.message.id == record.discord_message_id:
-            await interaction.response.edit_message(embed=embed, view=view)
-        elif not interaction.response.is_done():
-            await interaction.response.defer(thinking=False)
+        if not responded:
+            notify_msg = await self._get_notify_message(topic_id=topic_id)
+            if notify_msg:
+                try:
+                    await notify_msg.edit(view=processing_view)
+                except Exception:
+                    pass
 
         thread_id = await self._create_thread_if_needed(
             channel=channel,
@@ -626,76 +887,142 @@ class BotService(discord.Client):
         )
         _ = thread_id
         await self._ensure_thread_controls(topic_id=topic_id)
-        if not had_thread:
-            await self._thread_log(topic_id=topic_id, message="Thread created.")
-        await self._thread_log(topic_id=topic_id, message=f"Claimed by {interaction.user.mention}.")
+        await self._thread_log(
+            topic_id=topic_id,
+            message=f"Claimed by {self._user_label(interaction.user)}.",
+        )
 
         await self.handle_discourse_topic_event(topic_id=topic_id)
+        await self._finish_interaction(interaction, deferred=deferred)
 
     async def handle_unclaim(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
             await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await self._respond_ephemeral(interaction, str(e))
             return
 
         if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Unexpected user type.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Unexpected user type.")
             return
 
         if not self._member_has_override_permission(interaction.user):
-            await interaction.response.send_message("Only RRO / ICs can unclaim.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Only RRO / ICs can unclaim.")
             return
 
         before = await self.db.get_application(topic_id)
         await self.db.force_claim(topic_id=topic_id, user_id=None)
         if self.config.is_dry_run:
-            await interaction.response.send_message("dry-run: unclaimed in DB.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "dry-run: unclaimed in DB.")
             return
 
-        embed, view = await self._render_for_topic(topic_id=topic_id)
-        notify_msg = await self._get_notify_message(topic_id=topic_id)
-        if notify_msg:
-            await notify_msg.edit(embed=embed, view=view)
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False)
+        claimed_before = bool(before and before.claimed_by_user_id)
+        processing_view = ApplicationView(
+            topic_id=topic_id,
+            service=self,
+            claimed=claimed_before,
+            processing=True,
+            processing_label="Unclaiming...",
+        )
+        responded = False
+        if interaction.message:
+            try:
+                await interaction.response.edit_message(view=processing_view)
+                responded = True
+            except Exception:
+                responded = False
+        deferred = False if responded else await self._defer_interaction(interaction)
+        if not responded:
+            try:
+                if interaction.message:
+                    await interaction.message.edit(view=processing_view)
+                else:
+                    notify_msg = await self._get_notify_message(topic_id=topic_id)
+                    if notify_msg:
+                        await notify_msg.edit(view=processing_view)
+            except Exception:
+                pass
+
         await self._ensure_thread_controls(topic_id=topic_id)
         await self.handle_discourse_topic_event(topic_id=topic_id)
         previous = await self._resolve_claimed_user(user_id=before.claimed_by_user_id) if before else None
-        prev_text = previous.mention if previous else "someone"
+        prev_text = self._user_label(previous)
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Unclaimed by {interaction.user.mention} (previous owner: {prev_text}).",
+            message=f"Unclaimed by {self._user_label(interaction.user)} (previous owner: {prev_text}).",
         )
+        await self._finish_interaction(interaction, deferred=deferred)
 
     async def handle_reassign(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
             await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await self._respond_ephemeral(interaction, str(e))
             return
 
         if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Unexpected user type.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Unexpected user type.")
             return
 
         if not self._member_has_admin_permission(interaction.user):
-            await interaction.response.send_message("Only override roles can reassign.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Only override roles can reassign.")
             return
 
-        # Show a temporary user selector on the main message (avoid ephemeral noise).
+        record = await self.db.get_application(topic_id)
+
+        claimed = bool(record and record.claimed_by_user_id)
+        processing_view = ApplicationView(
+            topic_id=topic_id,
+            service=self,
+            claimed=claimed,
+            processing=True,
+            processing_label="Loading assignees...",
+        )
+        responded = False
+        if interaction.message:
+            try:
+                await interaction.response.edit_message(view=processing_view)
+                responded = True
+            except Exception:
+                responded = False
+        deferred = False
+        if not responded:
+            try:
+                deferred = await self._defer_interaction(interaction)
+                if interaction.message:
+                    await interaction.message.edit(view=processing_view)
+                else:
+                    notify_msg = await self._get_notify_message(topic_id=topic_id)
+                    if notify_msg:
+                        await notify_msg.edit(view=processing_view)
+            except Exception:
+                pass
+            if deferred:
+                await self._finish_interaction(interaction, deferred=deferred)
+
+        # Show a temporary user selector on the message where the button was clicked.
         options = await self._build_reassign_options()
         embed, view = await self._render_for_topic(
             topic_id=topic_id,
             show_reassign_selector=True,
             reassign_options=options,
         )
-        notify_msg = await self._get_notify_message(topic_id=topic_id)
-        if notify_msg:
-            await notify_msg.edit(embed=embed, view=view)
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False)
-        await self._ensure_thread_controls(topic_id=topic_id)
+        try:
+            if interaction.message:
+                await interaction.message.edit(embed=embed, view=view)
+            else:
+                notify_msg = await self._get_notify_message(topic_id=topic_id)
+                if notify_msg:
+                    await notify_msg.edit(embed=embed, view=view)
+        except Exception:
+            pass
+        target_is_thread_controls = bool(
+            record
+            and interaction.message
+            and record.discord_control_message_id == interaction.message.id
+        )
+        if not target_is_thread_controls:
+            await self._ensure_thread_controls(topic_id=topic_id)
 
     async def handle_force_claim(self, interaction: discord.Interaction, *, topic_id: int, new_user_id: int) -> None:
         await self.db.force_claim(topic_id=topic_id, user_id=new_user_id)
@@ -712,105 +1039,195 @@ class BotService(discord.Client):
         try:
             await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await self._respond_ephemeral(interaction, str(e))
             return
 
         if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Unexpected user type.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Unexpected user type.")
             return
 
         if not self._member_has_admin_permission(interaction.user):
-            await interaction.response.send_message("Only override roles can reassign.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Only override roles can reassign.")
             return
 
         guild_id, _ = self._target_ids()
         guild = self.get_guild(guild_id)
         if not guild:
-            await interaction.response.send_message("Guild not available.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Guild not available.")
             return
 
         target_member = guild.get_member(new_user_id)
         if target_member and not self._member_is_claim_eligible(target_member):
-            await interaction.response.send_message(
+            await self._respond_ephemeral(
+                interaction,
                 "That user is not eligible (must have RRO or RRO ICs).",
-                ephemeral=True,
             )
             return
 
         before = await self.db.get_application(topic_id)
+        claimed_before = bool(before and before.claimed_by_user_id)
+        processing_label = "Reassigning..." if claimed_before else "Assigning..."
+        processing_view = ApplicationView(
+            topic_id=topic_id,
+            service=self,
+            claimed=claimed_before,
+            processing=True,
+            processing_label=processing_label,
+        )
+        responded = False
+        if interaction.message:
+            try:
+                await interaction.response.edit_message(view=processing_view)
+                responded = True
+            except Exception:
+                responded = False
+        deferred = False
+        if not responded:
+            deferred = await self._defer_interaction(interaction)
+            try:
+                if interaction.message:
+                    await interaction.message.edit(view=processing_view)
+                else:
+                    notify_msg = await self._get_notify_message(topic_id=topic_id)
+                    if notify_msg:
+                        await notify_msg.edit(view=processing_view)
+            except Exception:
+                pass
+
         await self.db.force_claim(topic_id=topic_id, user_id=new_user_id)
         await self.handle_discourse_topic_event(topic_id=topic_id)
 
-        embed, view = await self._render_for_topic(topic_id=topic_id, show_reassign_selector=False)
-        notify_msg = await self._get_notify_message(topic_id=topic_id)
-        if notify_msg:
-            await notify_msg.edit(embed=embed, view=view)
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False)
         await self._ensure_thread_controls(topic_id=topic_id)
         previous = await self._resolve_claimed_user(user_id=before.claimed_by_user_id) if before else None
-        prev_text = previous.mention if previous else "Unassigned"
+        prev_text = self._user_label(previous)
+        new_user = target_member or await self._resolve_claimed_user(user_id=new_user_id)
+        new_text = self._user_label(new_user) if new_user else f"User {new_user_id}"
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Reassigned by {interaction.user.mention}: {prev_text} -> <@{new_user_id}>.",
+            message=f"Reassigned by {self._user_label(interaction.user)}: {prev_text} -> {new_text}.",
         )
+        await self._finish_interaction(interaction, deferred=deferred)
 
     async def handle_set_stage(self, interaction: discord.Interaction, *, topic_id: int, stage_tag: str) -> None:
         try:
             await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
         except PermissionError as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await self._respond_ephemeral(interaction, str(e))
             return
 
         if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Unexpected user type.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "Unexpected user type.")
             return
 
         if not self._member_has_override_permission(interaction.user):
-            await interaction.response.send_message("You do not have permission to change stage.", ephemeral=True)
+            await self._respond_ephemeral(interaction, "You do not have permission to change stage.")
             return
 
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False)
+        record = await self.db.get_application(topic_id)
+        claimed = bool(record and record.claimed_by_user_id)
+        processing_view = ApplicationView(
+            topic_id=topic_id,
+            service=self,
+            claimed=claimed,
+            processing=True,
+            processing_label="Updating status...",
+        )
+        responded = False
+        if interaction.message:
+            try:
+                await interaction.response.edit_message(view=processing_view)
+                responded = True
+            except Exception:
+                responded = False
+        deferred = False
+        if not responded:
+            deferred = await self._defer_interaction(interaction)
+            try:
+                if interaction.message:
+                    await interaction.message.edit(view=processing_view)
+                else:
+                    notify_msg = await self._get_notify_message(topic_id=topic_id)
+                    if notify_msg:
+                        await notify_msg.edit(view=processing_view)
+            except Exception:
+                pass
 
         topic = await self.discourse.fetch_topic(topic_id)
         current = list(topic.tags)
         prev_stage = self._stage_tag_from_discourse_tags(current)
 
-        non_stage = [t for t in current if t not in STAGE_TAGS_DISCOURSE]
-        next_tags = non_stage + [stage_tag]
-        new_stage = "Accepted" if stage_tag == "p-file" else stage_tag
+        stage_tag_lower = stage_tag.lower()
+        if stage_tag_lower == "reject":
+            next_tags = []
+            new_stage = "Rejected"
+        else:
+            non_stage = [t for t in current if t not in STAGE_TAGS_DISCOURSE]
+            next_tags = non_stage + [stage_tag]
+            new_stage = "Accepted" if stage_tag_lower == "p-file" else stage_tag
 
         if self.config.is_dry_run:
             await interaction.followup.send(
                 f"dry-run: would set Discourse tags to: {', '.join(next_tags)}",
                 ephemeral=True,
             )
+            await self._finish_interaction(interaction, deferred=deferred)
             return
 
         await self.discourse.set_topic_tags(topic_id, next_tags)
         await self.db.set_tags_last_written(topic_id=topic_id, tags=next_tags)
+        if stage_tag_lower == "reject":
+            await self.db.set_archive_status(topic_id=topic_id, status="rejected")
         await self.handle_discourse_topic_event(topic_id=topic_id)
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Status (discord) changed by {interaction.user.mention}: **{prev_stage}** -> **{new_stage}**",
+            message=(
+                f"Status (discord) changed by {self._user_label(interaction.user)}: "
+                f"**{prev_stage}** -> **{new_stage}**"
+            ),
         )
         await self._ensure_thread_controls(topic_id=topic_id)
 
-        if stage_tag == "p-file":
-            when = datetime.now(timezone.utc) + timedelta(minutes=30)
+        if stage_tag_lower == "p-file":
+            delay_minutes = self._accepted_archive_delay_minutes()
+            when = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
             await self.db.mark_accepted(topic_id=topic_id, accepted=True)
+            await self.db.set_archive_status(topic_id=topic_id, status="accepted")
             await self.db.schedule_archive(topic_id=topic_id, when_iso=when.isoformat())
-            self._schedule_archive(topic_id=topic_id, delay_seconds=30 * 60, reason="discord-accepted")
+            self._cancel_archive(topic_id=topic_id)
+            self._schedule_archive(
+                topic_id=topic_id,
+                delay_seconds=self._accepted_archive_delay_seconds(),
+                reason="discord-accepted",
+            )
             await self._thread_log(
                 topic_id=topic_id,
-                message="Accepted. Archiving in 30 minutes (you can revert status until then).",
+                message=self._accepted_archive_message(),
             )
-        elif self._is_accepted(current) and stage_tag != "p-file":
+        elif stage_tag_lower == "reject":
+            delay_minutes = self._accepted_archive_delay_minutes()
+            when = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
             await self.db.mark_accepted(topic_id=topic_id, accepted=False)
+            await self.db.schedule_archive(topic_id=topic_id, when_iso=when.isoformat())
+            self._cancel_archive(topic_id=topic_id)
+            self._schedule_archive(
+                topic_id=topic_id,
+                delay_seconds=self._accepted_archive_delay_seconds(),
+                reason="discord-rejected",
+            )
+            await self._thread_log(
+                topic_id=topic_id,
+                message=self._rejected_archive_message(),
+            )
+        elif self._is_accepted(current) and stage_tag_lower != "p-file":
+            await self.db.mark_accepted(topic_id=topic_id, accepted=False)
+            await self.db.set_archive_status(topic_id=topic_id, status=None)
             await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
             self._cancel_archive(topic_id=topic_id)
             await self._thread_log(topic_id=topic_id, message="Reopened (Accepted removed).")
+        elif stage_tag_lower not in ("p-file", "reject"):
+            await self.db.set_archive_status(topic_id=topic_id, status=None)
+            await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
+            self._cancel_archive(topic_id=topic_id)
         # Update message without posting extra chatter.
         try:
             embed, view = await self._render_for_topic(topic_id=topic_id)
@@ -819,19 +1236,58 @@ class BotService(discord.Client):
                 await notify_msg.edit(embed=embed, view=view)
         except Exception:
             pass
+        await self._finish_interaction(interaction, deferred=deferred)
 
 
-def _verify_discourse_signature(*, secrets: tuple[str, ...], signature: str, raw_body: bytes) -> bool:
+def _verify_discourse_signature(
+    *,
+    secrets: tuple[str, ...],
+    signature: str,
+    raw_body: bytes,
+    debug: bool = False,
+) -> bool:
+    def _preview(value: str) -> str:
+        if not value:
+            return "(empty)"
+        if len(value) <= 12:
+            return value
+        return f"{value[:6]}...{value[-6:]}"
+
+    def _fingerprint(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
     if not secrets:
+        if debug:
+            log.info(
+                "Discourse signature debug: no secrets configured; body_len=%s",
+                len(raw_body),
+            )
         return True
     sig = signature.strip()
     if sig.startswith("sha256="):
         sig = sig.split("sha256=", 1)[1].strip()
+    if debug:
+        log.info(
+            "Discourse signature debug: header=%s normalized=%s body_len=%s secrets=%s",
+            _preview(signature),
+            _preview(sig),
+            len(raw_body),
+            len(secrets),
+        )
     for secret in secrets:
         if not secret:
             continue
         expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-        if hmac.compare_digest(sig, expected):
+        matched = hmac.compare_digest(sig, expected)
+        if debug:
+            log.info(
+                "Discourse signature debug: match=%s expected=%s secret_len=%s secret_fp=%s",
+                matched,
+                _preview(expected),
+                len(secret),
+                _fingerprint(secret),
+            )
+        if matched:
             return True
     return False
 
@@ -850,10 +1306,19 @@ async def create_web_app(*, config: BotConfig, bot: BotService) -> web.Applicati
             or request.headers.get("X-Discourse-Event-Signature-SHA256", "")
             or request.headers.get("X-Discourse-Signature", "")
         )
+        if config.discourse_signature_debug:
+            log.info(
+                "Discourse signature debug: content_length=%s body_len=%s encoding=%r body_sha256=%s",
+                request.headers.get("Content-Length", ""),
+                len(raw),
+                request.headers.get("Content-Encoding"),
+                hashlib.sha256(raw).hexdigest()[:12],
+            )
         if not _verify_discourse_signature(
             secrets=config.discourse_webhook_secrets,
             signature=sig,
             raw_body=raw,
+            debug=config.discourse_signature_debug,
         ):
             log.warning("Invalid signature. event=%r remote=%s", event_type, request.remote)
             return web.Response(status=403, text="Invalid signature")

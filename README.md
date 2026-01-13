@@ -36,6 +36,7 @@ Required:
 - `DISCORD_TEST_GUILD_ID` (default: `1068904351692771480`)
 - `DISCORD_TEST_NOTIFY_CHANNEL_ID` (default: `1460263195292864552`)
 - `DISCORD_TEST_ARCHIVE_CHANNEL_ID` (optional; post accepted summaries here)
+- `DISCORD_ACCEPTED_ARCHIVE_DELAY_MINUTES` (default: `30`; set `0` for immediate archive)
 - `DISCOURSE_BASE_URL` (default: `https://discourse.16aa.net`)
 - `LISTEN_HOST` (default: `0.0.0.0`)
 - `LISTEN_PORT` (default: `5055`)
@@ -56,6 +57,7 @@ Discourse API (required for Discord → Discourse tag changes; optional for read
 - `DISCOURSE_API_KEY`
 - `DISCOURSE_API_USER`
 - `DISCOURSE_WEBHOOK_SECRET` (or `DISCOURSE_WEBHOOK_SECRETS`)
+- `DISCOURSE_SIGNATURE_DEBUG` (optional; set `1` to log signature debug info)
 
 ### Safe testing modes
 
@@ -79,8 +81,32 @@ pip install -r requirements.txt
 python .\\bot_service.py
 ```
 
+### Discord bot permissions
+
+Applications channel (or its category):
+
+- View Channel
+- Send Messages
+- Send Messages in Threads
+- Create Public Threads
+- Manage Threads (lock/archive/delete)
+- Manage Messages (delete thread system messages)
+- Read Message History
+
+Archive channel (if used):
+
+- View Channel
+- Send Messages
+- Send Messages in Threads
+- Create Public Threads
+- Read Message History
+
+Notes:
+
+- If private threads are used, the bot must be explicitly added to each thread.
+
 ### Notes / limitations
 
-- Discord threads always have an auto-archive setting; “no auto-archive” is not supported. This bot sets it to the maximum available.
-- Reassign dropdown needs Discord “Server Members Intent” enabled for the bot so it can list eligible members.
-- When status becomes Accepted (`p-file`), the bot waits 30 minutes (during which status can be reverted), then archives: removes controls from the main card, disables controls in the thread, locks+archives the thread, and optionally posts a summary to `DISCORD_TEST_ARCHIVE_CHANNEL_ID`.
+- Discord threads always have an auto-archive setting; "no auto-archive" is not supported. This bot sets it to the maximum available.
+- Reassign dropdown needs Discord "Server Members Intent" enabled for the bot so it can list eligible members.
+- When status becomes Accepted (`p-file`) or Rejected (tags cleared), the bot waits the configured delay (minutes; can be `0`), then archives: disables controls in the thread, locks+archives the thread, posts a summary card to `DISCORD_TEST_ARCHIVE_CHANNEL_ID` when set, creates an archive thread containing a plain-text log transcript, removes the main channel card, and then deletes the original thread.

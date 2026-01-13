@@ -12,6 +12,8 @@ class ApplicationView(discord.ui.View):
         topic_id: int,
         service: "BotService",
         claimed: bool,
+        processing: bool = False,
+        processing_label: str = "Processing...",
         show_reassign_selector: bool = False,
         reassign_options: list[tuple[int, str]] | None = None,
     ):
@@ -21,27 +23,37 @@ class ApplicationView(discord.ui.View):
         self._show_reassign_selector = show_reassign_selector
         self._reassign_options = reassign_options or []
 
-        claim_button = discord.ui.Button(
-            label="Claimed" if claimed else "Claim Application",
-            style=discord.ButtonStyle.secondary if claimed else discord.ButtonStyle.success,
-            disabled=claimed,
-            custom_id=f"app_claim:{topic_id}",
-        )
-        claim_button.callback = self._on_claim  # type: ignore[assignment]
-        self.add_item(claim_button)
+        if processing:
+            claim_button = discord.ui.Button(
+                label=processing_label,
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            )
+            self.add_item(claim_button)
+        elif not claimed:
+            claim_button = discord.ui.Button(
+                label="Claim Application",
+                style=discord.ButtonStyle.success,
+                custom_id=f"app_claim:{topic_id}",
+            )
+            claim_button.callback = self._on_claim  # type: ignore[assignment]
+            self.add_item(claim_button)
 
         unclaim_button = discord.ui.Button(
             label="Unclaim",
             style=discord.ButtonStyle.secondary,
+            disabled=not claimed or processing,
             custom_id=f"app_unclaim:{topic_id}",
             row=1,
         )
         unclaim_button.callback = self._on_unclaim  # type: ignore[assignment]
         self.add_item(unclaim_button)
 
+        reassign_label = "Reassign" if claimed else "Assign"
         reassign_button = discord.ui.Button(
-            label="Reassign",
+            label=reassign_label,
             style=discord.ButtonStyle.secondary,
+            disabled=processing,
             custom_id=f"app_reassign:{topic_id}",
             row=1,
         )
@@ -54,11 +66,13 @@ class ApplicationView(discord.ui.View):
                 for uid, name in self._reassign_options[:25]
             ]
             if options:
+                placeholder = "Reassign to..." if claimed else "Assign to..."
                 reassign_select = discord.ui.Select(
-                    placeholder="Reassign to…",
+                    placeholder=placeholder,
                     min_values=1,
                     max_values=1,
                     options=options,
+                    disabled=processing,
                     custom_id=f"app_reassign_select:{topic_id}",
                     row=2,
                 )
@@ -94,8 +108,10 @@ class ApplicationView(discord.ui.View):
                 discord.SelectOption(label="Interview Scheduled", value="interview-scheduled"),
                 discord.SelectOption(label="Interview Held", value="interview-held"),
                 discord.SelectOption(label="On Hold", value="on-hold"),
-                discord.SelectOption(label="Accepted", value="Accepted"),
+                discord.SelectOption(label="Accept", value="accept"),
+                discord.SelectOption(label="Reject", value="reject"),
             ],
+            disabled=processing,
             custom_id=f"app_stage_select:{topic_id}",
             row=3 if self._show_reassign_selector else 2,
         )

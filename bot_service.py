@@ -7,7 +7,7 @@ from rro_bot.service import main
 
 if __name__ == "__main__":
     if load_dotenv:
-        load_dotenv()
+        load_dotenv(override=True)
     try:
         main()
     except KeyboardInterrupt:

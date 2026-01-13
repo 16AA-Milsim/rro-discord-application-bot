@@ -25,6 +25,18 @@ def _get_env_int(name: str, default: int | None = None) -> int:
         raise RuntimeError(f"Invalid int for env var {name}: {raw!r}") from e
 
 
+def _get_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "no", "n", "off"):
+        return False
+    raise RuntimeError(f"Invalid bool for env var {name}: {raw!r}")
+
+
 def _split_csv(raw: str) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
@@ -40,12 +52,14 @@ class BotConfig:
     discord_test_guild_id: int
     discord_test_notify_channel_id: int
     discord_test_archive_channel_id: int
+    accepted_archive_delay_minutes: int
 
     discord_allowed_role_names: tuple[str, ...]
     discord_override_role_names: tuple[str, ...]
 
     discourse_base_url: str
     discourse_webhook_secrets: tuple[str, ...]
+    discourse_signature_debug: bool
     discourse_api_key: str
     discourse_api_user: str
 
@@ -103,6 +117,10 @@ def load_config() -> BotConfig:
             "DISCORD_TEST_NOTIFY_CHANNEL_ID", 1460263195292864552
         ),
         discord_test_archive_channel_id=_get_env_int("DISCORD_TEST_ARCHIVE_CHANNEL_ID", 0),
+        accepted_archive_delay_minutes=max(
+            0,
+            _get_env_int("DISCORD_ACCEPTED_ARCHIVE_DELAY_MINUTES", 30),
+        ),
         discord_allowed_role_names=tuple(
             _split_csv(os.environ.get("DISCORD_ALLOWED_ROLE_NAMES", "RRO,RRO ICs"))
         ),
@@ -111,6 +129,7 @@ def load_config() -> BotConfig:
         ),
         discourse_base_url=os.environ.get("DISCOURSE_BASE_URL", "https://discourse.16aa.net").rstrip("/"),
         discourse_webhook_secrets=discourse_webhook_secrets,
+        discourse_signature_debug=_get_env_bool("DISCOURSE_SIGNATURE_DEBUG", False),
         discourse_api_key=os.environ.get("DISCOURSE_API_KEY", "").strip(),
         discourse_api_user=os.environ.get("DISCOURSE_API_USER", "").strip(),
         listen_host=os.environ.get("LISTEN_HOST", "0.0.0.0").strip(),

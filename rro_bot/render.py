@@ -25,7 +25,7 @@ def discourse_tags_to_discord(tags: list[str]) -> list[str]:
 
 
 def discord_stage_to_discourse_tag(stage: str) -> str:
-    return "p-file" if stage.lower() == "accepted" else stage
+    return "p-file" if stage.lower() in ("accept", "accepted") else stage
 
 
 def discourse_tags_to_stage_label(tags: list[str], *, icons: dict[str, str] | None = None) -> str:
@@ -68,7 +68,7 @@ def build_application_embed(
 ) -> RenderedApplication:
     owner_value = claimed_by.mention if claimed_by else "⚠️ Unassigned"
     embed = discord.Embed(
-        title=f"📄 {topic.title}" if topic.title else "📄 New application",
+        title=f"{topic.title}" if topic.title else "New application",
         url=topic.url,
         description=f"Submitted by **{topic.author}**",
         color=0x940039,
