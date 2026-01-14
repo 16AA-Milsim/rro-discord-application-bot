@@ -98,8 +98,28 @@ class DiscourseClient:
             )
 
         url = f"{self._base_url}/t/{topic_id}.json"
-        form: list[tuple[str, str]] = [("tags[]", t) for t in tags]
+        if tags:
+            form: list[tuple[str, str]] = [("tags[]", t) for t in tags]
+        else:
+            # Discourse expects an explicit empty tag array to clear tags.
+            form = [("tags[]", "")]
 
+        async with self._session.put(
+            url,
+            headers=self._headers(),
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            r.raise_for_status()
+
+    async def set_topic_title(self, topic_id: int, title: str) -> None:
+        if not self._api_key or not self._api_user:
+            raise RuntimeError(
+                "Discourse API credentials missing (DISCOURSE_API_KEY / DISCOURSE_API_USER)"
+            )
+
+        url = f"{self._base_url}/t/{topic_id}.json"
+        form: list[tuple[str, str]] = [("title", title)]
         async with self._session.put(
             url,
             headers=self._headers(),

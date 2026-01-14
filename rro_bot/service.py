@@ -6,25 +6,89 @@ import hmac
 import json
 import re
 import logging
+import os
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import aiohttp
 from aiohttp import web
 import discord
 
 from .config import BotConfig, load_config
-from .db import BotDb
-from .discourse import DiscourseClient
+from .db import ApplicationRecord, BotDb
+from .discourse import DiscourseClient, DiscourseTopic
 from .render import (
     STAGE_TAGS_DISCOURSE,
     build_application_embed,
     discourse_tags_to_discord,
     discourse_tags_to_stage_label,
 )
-from .views import ApplicationView
+from .views import ApplicationView, RenameTopicModal
 
 
 log = logging.getLogger("rro_bot")
+
+LOG_TAG_STATUS = ":small_orange_diamond: STATUS"
+LOG_TAG_NOTE = ":speech_balloon: NOTE"
+LOG_TAG_ASSIGN = ":small_blue_diamond: ASSIGN"
+LOG_TAG_SYSTEM = ":gear: SYSTEM"
+
+
+def _configure_logging() -> None:
+    def _env_bool(name: str, default: bool = False) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        value = raw.strip().lower()
+        if value in ("1", "true", "yes", "y", "on"):
+            return True
+        if value in ("0", "false", "no", "n", "off"):
+            return False
+        return default
+
+    def _env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    level_name = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+    level = logging.getLevelName(level_name)
+    if not isinstance(level, int):
+        level = logging.INFO
+
+    log_file = os.environ.get("LOG_FILE", "logs/bot.log").strip()
+    log_to_console = _env_bool("LOG_TO_CONSOLE", True)
+    max_bytes = _env_int("LOG_MAX_BYTES", 10 * 1024 * 1024)
+    backup_count = _env_int("LOG_BACKUP_COUNT", 5)
+
+    handlers: list[logging.Handler] = []
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
+        handlers.append(file_handler)
+
+    if log_to_console:
+        handlers.append(logging.StreamHandler())
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers if handlers else None,
+    )
+
+    logging.captureWarnings(True)
+
 
 def _log_task_exceptions(task: asyncio.Task) -> None:
     try:
@@ -43,12 +107,15 @@ class BotService(discord.Client):
         intents = discord.Intents.default()
         intents.guilds = True
         intents.members = True
+        intents.message_content = True
         super().__init__(intents=intents)
         self.config = config
         self.db = db
         self.discourse = discourse
         self._topic_locks: dict[int, asyncio.Lock] = {}
         self._archive_tasks: dict[int, asyncio.Task] = {}
+        self._expected_message_deletes: set[int] = set()
+        self._expected_thread_deletes: set[int] = set()
 
     async def setup_hook(self) -> None:
         await self.db.init()
@@ -57,6 +124,70 @@ class BotService(discord.Client):
         log.info("Logged in as %s", self.user)
         await self._restore_views()
         await self._restore_scheduled_archives()
+        await self._reconcile_missing_resources()
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        if not payload.guild_id:
+            return
+        target_guild_id, _ = self._target_ids()
+        if payload.guild_id != target_guild_id:
+            return
+        message_id = payload.message_id
+        if message_id in self._expected_message_deletes:
+            self._expected_message_deletes.discard(message_id)
+            return
+
+        record = await self.db.get_application_by_message_id(message_id)
+        if record and not record.archived_at:
+            guild = self.get_guild(payload.guild_id)
+            actor = None
+            if guild:
+                actor = await self._resolve_audit_actor_for_message_delete(
+                    guild=guild,
+                    channel_id=payload.channel_id,
+                )
+            await self._handle_missing_card(record=record, actor=actor, reason="delete-event")
+            return
+
+        record = await self.db.get_application_by_control_message_id(message_id)
+        if record and not record.archived_at:
+            if record.discord_thread_id and record.discord_thread_id in self._expected_thread_deletes:
+                return
+            guild = self.get_guild(payload.guild_id)
+            actor = None
+            if guild:
+                actor = await self._resolve_audit_actor_for_message_delete(
+                    guild=guild,
+                    channel_id=payload.channel_id,
+                )
+            await self._handle_missing_controls(
+                record=record,
+                actor=actor,
+                reason="delete-event",
+                message_id=message_id,
+            )
+
+    async def on_thread_delete(self, thread: discord.Thread) -> None:
+        if not thread.guild:
+            return
+        target_guild_id, _ = self._target_ids()
+        if thread.guild.id != target_guild_id:
+            return
+        if thread.id in self._expected_thread_deletes:
+            self._expected_thread_deletes.discard(thread.id)
+            return
+        record = await self.db.get_application_by_thread_id(thread.id)
+        if record and not record.archived_at:
+            actor = await self._resolve_audit_actor_for_thread_delete(
+                guild=thread.guild,
+                thread_id=thread.id,
+            )
+            await self._handle_missing_thread(
+                record=record,
+                actor=actor,
+                reason="delete-event",
+                thread_id=thread.id,
+            )
 
     async def _restore_views(self) -> None:
         for record in await self.db.list_applications():
@@ -137,154 +268,206 @@ class BotService(discord.Client):
         if archive_status != "rejected" and not self._is_accepted(topic.tags):
             await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
             return
-
-        notify_msg = await self._get_notify_message(topic_id=topic_id)
-        parent_channel = self.get_channel(record.discord_channel_id)
-        if not isinstance(parent_channel, discord.TextChannel):
-            parent_channel = None
-
-        # Ensure we have a thread; if acceptance happened without a claim/thread, create one.
-        thread = await self._get_thread_for_topic(topic_id=topic_id)
-        if thread is None and notify_msg:
-            if parent_channel:
-                _ = await self._create_thread_if_needed(
-                    channel=parent_channel,
-                    message=notify_msg,
-                    topic_title=topic.title,
-                    topic_id=topic_id,
-                )
-                thread = await self._get_thread_for_topic(topic_id=topic_id)
-
-        thread_link = None
-        if thread:
-            guild_id, _ = self._target_ids()
-            thread_link = f"https://discord.com/channels/{guild_id}/{thread.id}"
-
-        # Thread: disable controls and lock/archive.
-        if thread and record.discord_control_message_id:
+        if archive_status == "rejected" and topic.tags and not self.config.is_dry_run:
             try:
-                controls_msg = await thread.fetch_message(record.discord_control_message_id)
-                embed = controls_msg.embeds[0] if controls_msg.embeds else None
-                await controls_msg.edit(content="Archived (Accepted)", embed=embed, view=None)
+                await self.discourse.set_topic_tags(topic_id, [])
+                await self.db.set_tags_last_written(topic_id=topic_id, tags=[])
+                topic = await self.discourse.fetch_topic(topic_id)
             except Exception:
-                pass
-        if thread:
-            try:
-                await thread.edit(locked=True, archived=True)
-            except Exception:
-                pass
+                log.exception("Failed to clear Discourse tags on reject (topic_id=%s)", topic_id)
 
-        # Optional: post summary and transcript thread in archive channel.
-        archive_posted = False
-        transcript_sent = False
-        archive_thread: discord.Thread | None = None
-        archive_channel_id = self.config.target_archive_channel_id()
-        archive_channel: discord.TextChannel | None = None
-        if archive_channel_id:
-            archive_channel = self.get_channel(archive_channel_id)
-            if archive_channel is None:
-                try:
-                    archive_channel = await self.fetch_channel(archive_channel_id)
-                except Exception:
-                    archive_channel = None
-            if isinstance(archive_channel, discord.TextChannel):
-                owner = await self._resolve_claimed_user(user_id=record.claimed_by_user_id)
-                if archive_status == "rejected":
-                    status = "❌ Rejected"
-                else:
-                    status = discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())
-                embed = discord.Embed(
-                    title=topic.title or "Application",
-                    url=topic.url,
-                    color=0x2ecc71,
-                    description=f"Owner: {self._user_label(owner)}\nStatus: {status}",
-                )
-                try:
-                    archive_label = "Rejected (Archived)" if archive_status == "rejected" else "Accepted (Archived)"
-                    archive_msg = await archive_channel.send(content=archive_label, embed=embed)
-                    archive_posted = True
-                    log.info(
-                        "Archive summary posted (topic_id=%s channel_id=%s message_id=%s)",
-                        topic_id,
-                        archive_channel.id,
-                        archive_msg.id,
-                    )
-                    archive_thread = await self._create_archive_thread(
-                        message=archive_msg,
-                        topic_title=topic.title,
-                    )
-                    log.info(
-                        "Archive thread created (topic_id=%s thread_id=%s)",
-                        topic_id,
-                        archive_thread.id,
-                    )
-                except Exception:
-                    log.exception("Failed to post archive summary (topic_id=%s)", topic_id)
+        archive_started = False
+        try:
+            await self.db.set_archive_in_progress(topic_id=topic_id, in_progress=True)
+            await self._apply_processing_view(topic_id=topic_id, label="Archiving...")
+            archive_started = True
 
-                if archive_thread:
-                    if thread:
-                        try:
-                            await archive_thread.send("Thread log:")
-                            messages_sent = await self._send_transcript_to_thread(
-                                source_thread=thread,
-                                dest_thread=archive_thread,
-                            )
-                            log.info(
-                                "Archive transcript sent (topic_id=%s messages=%s)",
-                                topic_id,
-                                messages_sent,
-                            )
-                            transcript_sent = True
-                        except Exception:
-                            log.exception("Failed to export thread transcript (topic_id=%s)", topic_id)
+            record = await self.db.get_application(topic_id)
+            if not record:
+                return
+            notify_msg = await self._get_notify_message(topic_id=topic_id, log_missing=False)
+            parent_channel = self.get_channel(record.discord_channel_id)
+            if not isinstance(parent_channel, discord.TextChannel):
+                parent_channel = None
+            if notify_msg:
+                try:
+                    embed, view = await self._render_for_topic_data(topic=topic, record=record)
+                    await notify_msg.edit(embed=embed, view=view)
+                except Exception:
+                    pass
+
+            thread = await self._get_thread_for_topic(topic_id=topic_id)
+            thread_link = None
+            if thread:
+                guild_id, _ = self._target_ids()
+                thread_link = f"https://discord.com/channels/{guild_id}/{thread.id}"
+                await self._ensure_thread_controls(topic_id=topic_id, topic=topic, record=record)
+
+            # Optional: post summary and transcript thread in archive channel.
+            archive_posted = False
+            transcript_sent = False
+            archive_thread: discord.Thread | None = None
+            archive_channel_id = self.config.target_archive_channel_id()
+            archive_channel: discord.TextChannel | None = None
+            if archive_channel_id:
+                archive_channel = self.get_channel(archive_channel_id)
+                if archive_channel is None:
+                    try:
+                        archive_channel = await self.fetch_channel(archive_channel_id)
+                    except Exception:
+                        archive_channel = None
+                if isinstance(archive_channel, discord.TextChannel):
+                    owner = await self._resolve_claimed_user(user_id=record.claimed_by_user_id)
+                    if archive_status == "rejected":
+                        status = "❌ Rejected"
                     else:
-                        try:
-                            await archive_thread.send("No source thread was available.")
-                            transcript_sent = True
-                        except Exception:
-                            pass
-                elif archive_posted:
-                    log.warning(
-                        "Archive thread missing (topic_id=%s channel_id=%s)",
-                        topic_id,
-                        archive_channel.id,
+                        status = discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())
+                    color = 0xE74C3C if archive_status == "rejected" else 0x2ECC71
+                    embed = discord.Embed(
+                        title=topic.title or "Application",
+                        url=topic.url,
+                        color=color,
+                        description=f"Owner: {self._user_label(owner)}\nStatus: {status}",
                     )
+                    try:
+                        archive_label = "Rejected (Archived)" if archive_status == "rejected" else "Accepted (Archived)"
+                        archive_msg = await archive_channel.send(content=archive_label, embed=embed)
+                        archive_posted = True
+                        log.info(
+                            "Archive summary posted (topic_id=%s channel_id=%s message_id=%s)",
+                            topic_id,
+                            archive_channel.id,
+                            archive_msg.id,
+                        )
+                        archive_thread = await self._create_archive_thread(
+                            message=archive_msg,
+                            topic_title=topic.title,
+                        )
+                        log.info(
+                            "Archive thread created (topic_id=%s thread_id=%s)",
+                            topic_id,
+                            archive_thread.id,
+                        )
+                    except Exception:
+                        log.exception("Failed to post archive summary (topic_id=%s)", topic_id)
 
-        # Main channel: remove the application card once the archive summary and transcript are posted.
-        if archive_posted and transcript_sent and notify_msg:
-            try:
-                await notify_msg.delete()
-                notify_msg = None
-            except discord.NotFound:
-                notify_msg = None
-            except Exception:
-                log.exception("Failed to delete archived notification (topic_id=%s)", topic_id)
+                    if archive_thread:
+                        if thread:
+                            try:
+                                await archive_thread.send("Thread log:")
+                                messages_sent = await self._send_transcript_to_thread(
+                                    source_thread=thread,
+                                    dest_thread=archive_thread,
+                                )
+                                log.info(
+                                    "Archive transcript sent (topic_id=%s messages=%s)",
+                                    topic_id,
+                                    messages_sent,
+                                )
+                                transcript_sent = True
+                            except Exception:
+                                log.exception("Failed to export thread transcript (topic_id=%s)", topic_id)
+                        else:
+                            try:
+                                await archive_thread.send("No source thread was available.")
+                                transcript_sent = True
+                            except Exception:
+                                pass
+                    elif archive_posted:
+                        log.warning(
+                            "Archive thread missing (topic_id=%s channel_id=%s)",
+                            topic_id,
+                            archive_channel.id,
+                        )
 
-        # Fallback: keep a minimal Accepted stub if we did not delete the message.
-        if notify_msg:
-            try:
-                embed, _view = await self._render_for_topic(topic_id=topic_id)
-                embed.add_field(
-                    name="Archive",
-                    value=f"[Open thread]({thread_link})" if thread_link else "Thread not available",
-                    inline=False,
-                )
-                await notify_msg.edit(embed=embed, view=None)
-            except discord.NotFound:
-                pass
-            except Exception:
-                log.exception("Failed to update archived notification (topic_id=%s)", topic_id)
+            # Main channel: remove the application card once the archive summary and transcript are posted.
+            if archive_posted and transcript_sent and notify_msg:
+                try:
+                    self._expected_message_deletes.add(notify_msg.id)
+                    await notify_msg.delete()
+                    notify_msg = None
+                except discord.NotFound:
+                    self._expected_message_deletes.discard(notify_msg.id)
+                    notify_msg = None
+                except Exception:
+                    self._expected_message_deletes.discard(notify_msg.id)
+                    log.exception("Failed to delete archived notification (topic_id=%s)", topic_id)
 
-        if transcript_sent and archive_posted and thread:
-            try:
-                await thread.delete()
-            except Exception:
-                log.exception("Failed to delete archived thread (topic_id=%s)", topic_id)
-            if parent_channel:
-                await self._delete_thread_system_message(channel=parent_channel, thread=thread)
+            # Fallback: keep a minimal Accepted stub if we did not delete the message.
+            if notify_msg:
+                try:
+                    embed, _view = await self._render_for_topic_data(topic=topic, record=record)
+                    embed.add_field(
+                        name="Archive",
+                        value=f"[Open thread]({thread_link})" if thread_link else "Thread not available",
+                        inline=False,
+                    )
+                    await notify_msg.edit(embed=embed, view=None)
+                except discord.NotFound:
+                    pass
+                except Exception:
+                    log.exception("Failed to update archived notification (topic_id=%s)", topic_id)
 
-        await self.db.mark_archived(topic_id=topic_id, archived=True)
-        await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
+            if transcript_sent and archive_posted and thread:
+                try:
+                    if record.discord_control_message_id:
+                        controls_msg = await thread.fetch_message(record.discord_control_message_id)
+                        embed = controls_msg.embeds[0] if controls_msg.embeds else None
+                        final_label = "Archived (Rejected)" if archive_status == "rejected" else "Archived (Accepted)"
+                        await controls_msg.edit(content=final_label, embed=embed, view=None)
+                except Exception:
+                    pass
+                try:
+                    await thread.edit(locked=True, archived=True)
+                except Exception:
+                    pass
+                try:
+                    if record.discord_control_message_id:
+                        self._expected_message_deletes.add(record.discord_control_message_id)
+                    self._expected_thread_deletes.add(thread.id)
+                    await thread.delete()
+                except Exception:
+                    self._expected_thread_deletes.discard(thread.id)
+                    if record.discord_control_message_id:
+                        self._expected_message_deletes.discard(record.discord_control_message_id)
+                    log.exception("Failed to delete archived thread (topic_id=%s)", topic_id)
+                if parent_channel:
+                    record = await self.db.get_application(topic_id)
+                    names = record.thread_name_history if record else None
+                    await self._delete_thread_system_message(
+                        channel=parent_channel,
+                        thread=thread,
+                        thread_names=names,
+                    )
+            elif thread:
+                try:
+                    if record.discord_control_message_id:
+                        controls_msg = await thread.fetch_message(record.discord_control_message_id)
+                        embed = controls_msg.embeds[0] if controls_msg.embeds else None
+                        final_label = "Archived (Rejected)" if archive_status == "rejected" else "Archived (Accepted)"
+                        await controls_msg.edit(content=final_label, embed=embed, view=None)
+                except Exception:
+                    pass
+                try:
+                    await thread.edit(locked=True, archived=True)
+                except Exception:
+                    pass
+
+            await self.db.mark_archived(topic_id=topic_id, archived=True)
+            await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
+        finally:
+            if archive_started:
+                await self.db.set_archive_in_progress(topic_id=topic_id, in_progress=False)
+                record = await self.db.get_application(topic_id)
+                if record and not record.archived_at:
+                    try:
+                        embed, view = await self._render_for_topic(topic_id=topic_id)
+                        notify_msg = await self._get_notify_message(topic_id=topic_id, log_missing=False)
+                        if notify_msg:
+                            await notify_msg.edit(embed=embed, view=view)
+                        await self._ensure_thread_controls(topic_id=topic_id, allow_create=False)
+                    except Exception:
+                        pass
 
     def _target_ids(self) -> tuple[int, int]:
         return self.config.target_guild_and_channel()
@@ -298,6 +481,73 @@ class BotService(discord.Client):
         for e in guild.emojis:
             icons[e.name] = str(e)
         return icons
+
+    def _stage_icon_for_name(self, stage: str) -> str:
+        key = stage.strip().lower().replace(" ", "-")
+        icons = self._status_icons()
+        if key in ("accept", "accepted", "p-file"):
+            return icons.get("accepted") or ":white_check_mark:"
+        if key in ("reject", "rejected"):
+            return icons.get("rejected") or ":x:"
+        if key == "new-application":
+            return icons.get("new_application") or ":star:"
+        if key == "letter-sent":
+            return icons.get("letter_sent") or ":envelope:"
+        if key == "interview-scheduled":
+            return icons.get("interview_scheduled") or ":calendar:"
+        if key == "interview-held":
+            return icons.get("interview_held") or ":calendar_check:"
+        if key == "on-hold":
+            return icons.get("pause") or ":pause_button:"
+        return ":grey_question:"
+
+    def _format_status_update(self, new_stage: str) -> str:
+        new_icon = self._stage_icon_for_name(new_stage)
+        return f"{new_icon} {new_stage}"
+
+    def _topic_cache_is_fresh(
+        self,
+        record: ApplicationRecord,
+        *,
+        max_age_seconds: int | None = None,
+    ) -> bool:
+        if max_age_seconds is None:
+            max_age_seconds = self.config.discourse_topic_cache_ttl_seconds
+        if max_age_seconds <= 0:
+            return False
+        if not record.topic_synced_at:
+            return False
+        try:
+            synced_at = datetime.fromisoformat(record.topic_synced_at)
+        except Exception:
+            return False
+        if synced_at.tzinfo is None:
+            synced_at = synced_at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - synced_at).total_seconds() <= max_age_seconds
+
+    def _cached_topic_from_record(self, record: ApplicationRecord) -> DiscourseTopic:
+        title = record.topic_title or f"Topic {record.topic_id}"
+        author = record.topic_author or "Unknown"
+        url = f"{self.config.discourse_base_url}/t/{record.topic_id}"
+        return DiscourseTopic(
+            id=record.topic_id,
+            title=title,
+            slug=str(record.topic_id),
+            url=url,
+            category_id=self.config.target_applications_category_id(),
+            tags=list(record.tags_last_seen),
+            author=author,
+        )
+
+    async def _record_thread_name(self, *, topic_id: int, name: str) -> None:
+        record = await self.db.get_application(topic_id)
+        if not record:
+            return
+        names = list(record.thread_name_history)
+        if name in names:
+            return
+        names.append(name)
+        await self.db.set_thread_name_history(topic_id=topic_id, names=names)
 
     async def _resolve_claimed_user(self, *, user_id: int | None) -> discord.abc.User | None:
         if not user_id:
@@ -329,6 +579,12 @@ class BotService(discord.Client):
         if username and display_name != username:
             return f"{display_name} ({username})"
         return display_name
+
+    @staticmethod
+    def _user_display_name(user: discord.abc.User | None) -> str:
+        if not user:
+            return "Unknown"
+        return getattr(user, "display_name", None) or user.name
 
     async def _respond_ephemeral(self, interaction: discord.Interaction, message: str) -> None:
         if interaction.response.is_done():
@@ -366,12 +622,17 @@ class BotService(discord.Client):
     def _format_transcript_line(self, msg: discord.Message) -> str:
         author = getattr(msg.author, "display_name", msg.author.name)
         timestamp = msg.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        content = msg.content or ""
+        content = msg.content or msg.clean_content or msg.system_content or ""
         if msg.attachments:
             attachments = " ".join(a.url for a in msg.attachments)
             if content:
                 content += " "
             content += f"[attachments: {attachments}]"
+        if msg.stickers:
+            stickers = " ".join(s.name for s in msg.stickers)
+            if content:
+                content += " "
+            content += f"[stickers: {stickers}]"
         if msg.embeds:
             if content:
                 content += " "
@@ -386,7 +647,7 @@ class BotService(discord.Client):
                 content = content[match.end():]
             return f"[{timestamp} UTC] {content}"
 
-        return f"[{timestamp} UTC] {author}: {content}"
+        return f"[{timestamp} UTC] {LOG_TAG_NOTE}: {author}: {content}"
 
     async def _send_transcript_to_thread(
         self,
@@ -397,7 +658,22 @@ class BotService(discord.Client):
         max_len = 1900
         buffer = ""
         messages_sent = 0
+        ignore_types = {
+            discord.MessageType.thread_created,
+            discord.MessageType.thread_starter_message,
+        }
+        for attr in ("thread_name_change", "channel_name_change"):
+            msg_type = getattr(discord.MessageType, attr, None)
+            if msg_type is not None:
+                ignore_types.add(msg_type)
         async for msg in source_thread.history(limit=None, oldest_first=True):
+            if msg.type in ignore_types:
+                continue
+            if self.user and msg.author.id == self.user.id:
+                if msg.content.strip() == "Controls" and msg.embeds:
+                    continue
+                if not msg.content and not msg.embeds and not msg.attachments and not msg.stickers:
+                    continue
             line = self._format_transcript_line(msg)
             if len(line) > max_len:
                 line = line[: max_len - 3] + "..."
@@ -411,6 +687,26 @@ class BotService(discord.Client):
             await dest_thread.send(buffer)
             messages_sent += 1
         return messages_sent
+
+    async def _add_thread_members(
+        self,
+        *,
+        thread: discord.Thread,
+        claimed_user_id: int | None,
+    ) -> None:
+        if not claimed_user_id:
+            return
+        guild_id, _ = self._target_ids()
+        guild = self.get_guild(guild_id)
+        if not guild:
+            return
+        member = guild.get_member(claimed_user_id)
+        if not member:
+            return
+        try:
+            await thread.add_user(member)
+        except Exception:
+            pass
 
     @staticmethod
     def _discord_ts() -> str:
@@ -469,9 +765,263 @@ class BotService(discord.Client):
 
         raise PermissionError("Wrong channel for current DISCORD_MODE")
 
-    async def _get_notify_message(self, *, topic_id: int) -> discord.Message | None:
+    async def _get_notify_message(
+        self,
+        *,
+        topic_id: int,
+        log_missing: bool = True,
+    ) -> discord.Message | None:
+        record = await self.db.get_application(topic_id)
+        if not record or record.discord_message_missing:
+            return None
+        channel = self.get_channel(record.discord_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return None
+        try:
+            return await channel.fetch_message(record.discord_message_id)
+        except discord.NotFound:
+            if log_missing:
+                await self._handle_missing_card(record=record, actor=None, reason="missing")
+            return None
+        except Exception:
+            return None
+
+    def _can_view_audit_log(self, guild: discord.Guild) -> bool:
+        member = guild.me
+        if not member and self.user:
+            member = guild.get_member(self.user.id)
+        return bool(member and member.guild_permissions.view_audit_log)
+
+    @staticmethod
+    def _audit_actor_label(user: discord.abc.User | None) -> str:
+        if not user:
+            return "Unknown"
+        display_name = getattr(user, "display_name", None) or user.name
+        username = getattr(user, "name", "")
+        if username and display_name != username:
+            return f"{display_name} ({username})"
+        return display_name
+
+    async def _resolve_audit_actor_for_message_delete(
+        self,
+        *,
+        guild: discord.Guild,
+        channel_id: int,
+    ) -> discord.abc.User | None:
+        if not self._can_view_audit_log(guild):
+            return None
+        now = datetime.now(timezone.utc)
+        try:
+            async for entry in guild.audit_logs(
+                limit=6,
+                action=discord.AuditLogAction.message_delete,
+            ):
+                extra = entry.extra
+                extra_channel = getattr(extra, "channel", None) if extra else None
+                if extra_channel and extra_channel.id != channel_id:
+                    continue
+                created_at = entry.created_at
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if (now - created_at).total_seconds() > 30:
+                    continue
+                return entry.user
+        except Exception:
+            return None
+        return None
+
+    async def _resolve_audit_actor_for_thread_delete(
+        self,
+        *,
+        guild: discord.Guild,
+        thread_id: int,
+    ) -> discord.abc.User | None:
+        if not self._can_view_audit_log(guild):
+            return None
+        action = getattr(discord.AuditLogAction, "thread_delete", discord.AuditLogAction.channel_delete)
+        now = datetime.now(timezone.utc)
+        try:
+            async for entry in guild.audit_logs(limit=6, action=action):
+                target = entry.target
+                if target and getattr(target, "id", None) != thread_id:
+                    continue
+                created_at = entry.created_at
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if (now - created_at).total_seconds() > 30:
+                    continue
+                return entry.user
+        except Exception:
+            return None
+        return None
+
+    async def _fetch_topic_title(self, *, topic_id: int) -> str | None:
+        try:
+            topic = await self.discourse.fetch_topic(topic_id)
+        except Exception:
+            return None
+        return topic.title or None
+
+    async def _create_audit_thread(
+        self,
+        *,
+        message: discord.Message,
+        topic_title: str | None,
+        topic_id: int,
+    ) -> discord.Thread:
+        base = topic_title or f"Topic {topic_id}"
+        base_name = f"Audit - {base}".strip()
+        thread_name = base_name[:100] if len(base_name) > 100 else base_name
+        archive_options = (10080, 4320, 1440)
+        last_error: Exception | None = None
+        for duration in archive_options:
+            try:
+                return await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=duration,
+                )
+            except Exception as e:
+                last_error = e
+        raise last_error or RuntimeError("Failed to create audit thread")
+
+    async def _post_audit_thread(
+        self,
+        *,
+        topic_id: int,
+        topic_title: str | None,
+        summary: str,
+        details: list[str],
+    ) -> None:
+        archive_channel_id = self.config.target_archive_channel_id()
+        if not archive_channel_id:
+            log.warning("Audit log skipped (no archive channel). topic_id=%s", topic_id)
+            return
+        archive_channel = self.get_channel(archive_channel_id)
+        if archive_channel is None:
+            try:
+                archive_channel = await self.fetch_channel(archive_channel_id)
+            except Exception:
+                archive_channel = None
+        if not isinstance(archive_channel, discord.TextChannel):
+            log.warning("Audit log skipped (archive channel missing). topic_id=%s", topic_id)
+            return
+        try:
+            audit_msg = await archive_channel.send(content=summary)
+        except Exception:
+            log.exception("Failed to post audit summary (topic_id=%s)", topic_id)
+            return
+        try:
+            audit_thread = await self._create_audit_thread(
+                message=audit_msg,
+                topic_title=topic_title,
+                topic_id=topic_id,
+            )
+            if details:
+                await audit_thread.send("\n".join(details))
+        except Exception:
+            log.exception("Failed to post audit details (topic_id=%s)", topic_id)
+
+    async def _apply_processing_view(self, *, topic_id: int, label: str) -> None:
+        record = await self.db.get_application(topic_id)
+        if not record or record.archived_at:
+            return
+        view = ApplicationView(
+            topic_id=topic_id,
+            service=self,
+            claimed=bool(record.claimed_by_user_id),
+            processing=True,
+            processing_label=label,
+        )
+        if not record.discord_message_missing:
+            channel = self.get_channel(record.discord_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(record.discord_message_id)
+                    await msg.edit(view=view)
+                except Exception:
+                    pass
+        if record.discord_control_message_id:
+            thread = await self._get_thread_for_topic(topic_id=topic_id)
+            if thread:
+                try:
+                    controls_msg = await thread.fetch_message(record.discord_control_message_id)
+                    await controls_msg.edit(view=view)
+                except Exception:
+                    pass
+
+    async def _show_processing(
+        self,
+        *,
+        interaction: discord.Interaction,
+        topic_id: int,
+        view: ApplicationView,
+    ) -> bool:
+        responded = False
+        if interaction.message:
+            try:
+                await interaction.response.edit_message(view=view)
+                responded = True
+            except Exception:
+                responded = False
+        deferred = False if responded else await self._defer_interaction(interaction)
+        if not responded:
+            try:
+                if interaction.message:
+                    await interaction.message.edit(view=view)
+                else:
+                    notify_msg = await self._get_notify_message(topic_id=topic_id)
+                    if notify_msg:
+                        await notify_msg.edit(view=view)
+            except Exception:
+                pass
+        return deferred
+
+    async def _ensure_thread_for_action(
+        self,
+        *,
+        topic_id: int,
+        interaction: discord.Interaction,
+        claimed_user_id: int | None,
+    ) -> discord.Thread | None:
         record = await self.db.get_application(topic_id)
         if not record:
+            return None
+        thread = await self._get_thread_for_topic(topic_id=topic_id)
+        if thread:
+            await self._add_thread_members(thread=thread, claimed_user_id=claimed_user_id)
+            return thread
+
+        _, target_channel_id = self._target_ids()
+        if not interaction.channel or interaction.channel.id != target_channel_id:
+            return None
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return None
+
+        msg = interaction.message
+        if not msg and not record.discord_message_missing:
+            channel = self.get_channel(record.discord_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(record.discord_message_id)
+                except Exception:
+                    msg = None
+        if not msg:
+            return None
+
+        topic = await self.discourse.fetch_topic(topic_id)
+        await self._create_thread_if_needed(
+            channel=interaction.channel,
+            message=msg,
+            topic_title=topic.title,
+            topic_id=topic_id,
+        )
+        thread = await self._get_thread_for_topic(topic_id=topic_id)
+        if thread:
+            await self._add_thread_members(thread=thread, claimed_user_id=claimed_user_id)
+        return thread
+
+    async def _fetch_card_message(self, *, record: ApplicationRecord) -> discord.Message | None:
+        if record.discord_message_missing:
             return None
         channel = self.get_channel(record.discord_channel_id)
         if not isinstance(channel, discord.TextChannel):
@@ -481,8 +1031,192 @@ class BotService(discord.Client):
         except Exception:
             return None
 
-    async def _ensure_thread_controls(self, *, topic_id: int) -> None:
-        record = await self.db.get_application(topic_id)
+    async def _handle_missing_card(
+        self,
+        *,
+        record: ApplicationRecord,
+        actor: discord.abc.User | None,
+        reason: str,
+    ) -> None:
+        if record.archived_at:
+            return
+        already_missing = record.discord_message_missing
+        if not already_missing:
+            await self.db.set_message_missing(topic_id=record.topic_id, missing=True)
+
+        thread = await self._get_thread_for_topic(topic_id=record.topic_id)
+        thread_missing = thread is None
+        if thread_missing and record.discord_thread_id:
+            await self.db.set_thread_id(topic_id=record.topic_id, thread_id=None)
+            await self.db.set_control_message_id(topic_id=record.topic_id, message_id=None)
+
+        if not already_missing:
+            topic_title = await self._fetch_topic_title(topic_id=record.topic_id)
+            actor_label = self._audit_actor_label(actor)
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            details = [
+                "Manual deletion detected.",
+                f"Deleted item: application card message",
+                f"Actor: {actor_label}",
+                f"Detected at: {timestamp} UTC",
+                f"Reason: {reason}",
+                f"Topic ID: {record.topic_id}",
+                f"Channel ID: {record.discord_channel_id}",
+                f"Message ID: {record.discord_message_id}",
+                f"Outcome: {'record removed' if thread_missing else 'continuing via thread'}",
+            ]
+            await self._post_audit_thread(
+                topic_id=record.topic_id,
+                topic_title=topic_title,
+                summary=f"Audit: application card deleted (topic {record.topic_id})",
+                details=details,
+            )
+
+        if thread_missing:
+            await self._cleanup_application_record(topic_id=record.topic_id, reason="card-missing")
+
+    async def _handle_missing_thread(
+        self,
+        *,
+        record: ApplicationRecord,
+        actor: discord.abc.User | None,
+        reason: str,
+        thread_id: int,
+    ) -> None:
+        if record.archived_at:
+            return
+        await self.db.set_thread_id(topic_id=record.topic_id, thread_id=None)
+        await self.db.set_control_message_id(topic_id=record.topic_id, message_id=None)
+
+        card_msg = await self._fetch_card_message(record=record)
+        card_exists = card_msg is not None
+        if not card_exists and not record.discord_message_missing:
+            await self.db.set_message_missing(topic_id=record.topic_id, missing=True)
+
+        topic_title = await self._fetch_topic_title(topic_id=record.topic_id)
+        actor_label = self._audit_actor_label(actor)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        details = [
+            "Manual deletion detected.",
+            "Deleted item: application thread",
+            f"Actor: {actor_label}",
+            f"Detected at: {timestamp} UTC",
+            f"Reason: {reason}",
+            f"Topic ID: {record.topic_id}",
+            f"Thread ID: {thread_id}",
+            f"Outcome: {'record removed' if not card_exists else 'continuing via card'}",
+        ]
+        await self._post_audit_thread(
+            topic_id=record.topic_id,
+            topic_title=topic_title,
+            summary=f"Audit: application thread deleted (topic {record.topic_id})",
+            details=details,
+        )
+
+        if not card_exists:
+            await self._cleanup_application_record(topic_id=record.topic_id, reason="thread-missing")
+
+    async def _handle_missing_controls(
+        self,
+        *,
+        record: ApplicationRecord,
+        actor: discord.abc.User | None,
+        reason: str,
+        message_id: int,
+    ) -> None:
+        if record.archived_at:
+            return
+        await self.db.set_control_message_id(topic_id=record.topic_id, message_id=None)
+
+        topic_title = await self._fetch_topic_title(topic_id=record.topic_id)
+        actor_label = self._audit_actor_label(actor)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        cleanup = bool(record.discord_message_missing)
+        details = [
+            "Manual deletion detected.",
+            "Deleted item: thread controls message",
+            f"Actor: {actor_label}",
+            f"Detected at: {timestamp} UTC",
+            f"Reason: {reason}",
+            f"Topic ID: {record.topic_id}",
+            f"Thread ID: {record.discord_thread_id or 'unknown'}",
+            f"Message ID: {message_id}",
+            f"Outcome: {'record removed' if cleanup else 'controls will be recreated on next card action'}",
+        ]
+        await self._post_audit_thread(
+            topic_id=record.topic_id,
+            topic_title=topic_title,
+            summary=f"Audit: thread controls deleted (topic {record.topic_id})",
+            details=details,
+        )
+
+        if cleanup:
+            await self._cleanup_application_record(topic_id=record.topic_id, reason="controls-missing")
+
+    async def _cleanup_application_record(self, *, topic_id: int, reason: str) -> None:
+        self._cancel_archive(topic_id=topic_id)
+        await self.db.delete_application(topic_id=topic_id)
+        self._topic_locks.pop(topic_id, None)
+        log.info("Application record removed (topic_id=%s, reason=%s)", topic_id, reason)
+
+    async def _reconcile_missing_resources(self) -> None:
+        records = await self.db.list_applications()
+        for record in records:
+            if record.archived_at:
+                continue
+
+            if not record.discord_message_missing:
+                msg = await self._fetch_card_message(record=record)
+                if msg is None:
+                    await self._handle_missing_card(record=record, actor=None, reason="startup")
+                    record = await self.db.get_application(record.topic_id) or record
+
+            record = await self.db.get_application(record.topic_id)
+            if not record or record.archived_at:
+                continue
+
+            if record.discord_thread_id:
+                thread = await self._get_thread_for_topic(topic_id=record.topic_id)
+                if thread is None:
+                    await self._handle_missing_thread(
+                        record=record,
+                        actor=None,
+                        reason="startup",
+                        thread_id=record.discord_thread_id,
+                    )
+                    record = await self.db.get_application(record.topic_id) or record
+                else:
+                    if not record.thread_name_history:
+                        await self._record_thread_name(topic_id=record.topic_id, name=thread.name)
+
+            record = await self.db.get_application(record.topic_id)
+            if not record or record.archived_at:
+                continue
+
+            if record.discord_thread_id and record.discord_control_message_id:
+                thread = await self._get_thread_for_topic(topic_id=record.topic_id)
+                if thread:
+                    try:
+                        await thread.fetch_message(record.discord_control_message_id)
+                    except discord.NotFound:
+                        await self._handle_missing_controls(
+                            record=record,
+                            actor=None,
+                            reason="startup",
+                            message_id=record.discord_control_message_id,
+                        )
+                    except Exception:
+                        pass
+
+    async def _ensure_thread_controls(
+        self,
+        *,
+        topic_id: int,
+        allow_create: bool = False,
+        topic: DiscourseTopic | None = None,
+        record: ApplicationRecord | None = None,
+    ) -> None:
+        record = record or await self.db.get_application(topic_id)
         if not record or not record.discord_thread_id:
             return
         if record.archived_at:
@@ -492,21 +1226,30 @@ class BotService(discord.Client):
             return
 
         # Send or update a pinned controls message in the thread.
-        embed, view = await self._render_for_topic(topic_id=topic_id)
+        if topic:
+            embed, view = await self._render_for_topic_data(topic=topic, record=record)
+        else:
+            embed, view = await self._render_for_topic(topic_id=topic_id)
+        content = "Controls"
         controls_msg: discord.Message | None = None
 
         if record.discord_control_message_id:
             try:
                 controls_msg = await thread.fetch_message(record.discord_control_message_id)
+            except discord.NotFound:
+                controls_msg = None
+                await self.db.set_control_message_id(topic_id=topic_id, message_id=None)
             except Exception:
                 controls_msg = None
 
         if controls_msg is None:
-            controls_msg = await thread.send(content="Controls", embed=embed, view=view)
+            if not allow_create:
+                return
+            controls_msg = await thread.send(content=content, embed=embed, view=view)
             await self.db.set_control_message_id(topic_id=topic_id, message_id=controls_msg.id)
         else:
             try:
-                await controls_msg.edit(content="Controls", embed=embed, view=view)
+                await controls_msg.edit(content=content, embed=embed, view=view)
             except Exception:
                 pass
 
@@ -515,7 +1258,7 @@ class BotService(discord.Client):
         return any(role.name.lower() in allowed for role in member.roles)
 
     def _member_has_override_permission(self, member: discord.Member) -> bool:
-        allowed = {n.lower() for n in (self.config.discord_allowed_role_names + self.config.discord_override_role_names)}
+        allowed = {n.lower() for n in self.config.discord_override_role_names}
         return any(role.name.lower() in allowed for role in member.roles)
 
     def _member_has_admin_permission(self, member: discord.Member) -> bool:
@@ -550,26 +1293,25 @@ class BotService(discord.Client):
         eligible.sort(key=lambda t: t[1].lower())
         return eligible
 
-    async def _render_for_topic(
+    async def _render_for_topic_data(
         self,
         *,
-        topic_id: int,
+        topic: DiscourseTopic,
+        record: ApplicationRecord | None,
         show_reassign_selector: bool = False,
         claimed_by_override: discord.abc.User | None = None,
         reassign_options: list[tuple[int, str]] | None = None,
     ) -> tuple[discord.Embed, ApplicationView]:
-        topic = await self.discourse.fetch_topic(topic_id)
         tags_discord = discourse_tags_to_discord(topic.tags)
         stage_label = discourse_tags_to_stage_label(topic.tags, icons=self._status_icons())
 
-        record = await self.db.get_application(topic_id)
         if record and record.archive_status == "rejected":
             stage_label = "Rejected"
         claimed_user = claimed_by_override or await self._resolve_claimed_user(
             user_id=record.claimed_by_user_id if record else None
         )
         view = ApplicationView(
-            topic_id=topic_id,
+            topic_id=topic.id,
             service=self,
             claimed=bool(record and record.claimed_by_user_id),
             show_reassign_selector=show_reassign_selector,
@@ -582,6 +1324,35 @@ class BotService(discord.Client):
             claimed_by=claimed_user,
         )
         return rendered.embed, view
+
+    async def _render_for_topic(
+        self,
+        *,
+        topic_id: int,
+        show_reassign_selector: bool = False,
+        claimed_by_override: discord.abc.User | None = None,
+        reassign_options: list[tuple[int, str]] | None = None,
+    ) -> tuple[discord.Embed, ApplicationView]:
+        record = await self.db.get_application(topic_id)
+        if record and record.topic_title and record.tags_last_seen and self._topic_cache_is_fresh(record):
+            topic = self._cached_topic_from_record(record)
+        else:
+            topic = await self.discourse.fetch_topic(topic_id)
+            if record:
+                await self.db.set_topic_snapshot(
+                    topic_id=topic_id,
+                    title=topic.title,
+                    author=topic.author,
+                    tags=topic.tags,
+                    synced_at=datetime.now(timezone.utc).isoformat(),
+                )
+        return await self._render_for_topic_data(
+            topic=topic,
+            record=record,
+            show_reassign_selector=show_reassign_selector,
+            claimed_by_override=claimed_by_override,
+            reassign_options=reassign_options,
+        )
 
     async def handle_discourse_topic_event(
         self,
@@ -608,7 +1379,14 @@ class BotService(discord.Client):
         discourse_actor: str | None = None,
     ) -> None:
         topic = await self.discourse.fetch_topic(topic_id)
-        if topic.category_id != self.config.applications_category_id:
+        expected_category_id = self.config.target_applications_category_id()
+        if topic.category_id != expected_category_id:
+            log.info(
+                "Ignored webhook (category mismatch). topic_id=%s category_id=%s expected=%s",
+                topic_id,
+                topic.category_id,
+                expected_category_id,
+            )
             return
 
         tags_discord = discourse_tags_to_discord(topic.tags)
@@ -633,23 +1411,55 @@ class BotService(discord.Client):
         if record and record.claimed_by_user_id:
             claimed_user = await self._resolve_claimed_user(user_id=record.claimed_by_user_id)
             claimed = True
-
         rendered = build_application_embed(
             topic=topic,
             tags_discord=tags_discord,
             stage_label=stage_label,
             claimed_by=claimed_user,
         )
-        view = ApplicationView(topic_id=topic_id, service=self, claimed=claimed)
+        view = ApplicationView(
+            topic_id=topic_id,
+            service=self,
+            claimed=claimed,
+        )
 
         if record:
             if self.config.is_dry_run:
                 log.info("dry-run: would edit message topic_id=%s message_id=%s", topic_id, record.discord_message_id)
             else:
-                msg = await channel.fetch_message(record.discord_message_id)
-                await msg.edit(embed=rendered.embed, view=view)
-            await self.db.set_tags_last_seen(topic_id=topic_id, tags=topic.tags)
-            await self._ensure_thread_controls(topic_id=topic_id)
+                if not record.discord_message_missing:
+                    try:
+                        msg = await channel.fetch_message(record.discord_message_id)
+                        await msg.edit(embed=rendered.embed, view=view)
+                    except discord.NotFound:
+                        await self._handle_missing_card(
+                            record=record,
+                            actor=None,
+                            reason="discourse-update",
+                        )
+                        record = await self.db.get_application(topic_id)
+                        if not record:
+                            return
+                    except Exception:
+                        pass
+            await self.db.set_topic_snapshot(
+                topic_id=topic_id,
+                title=topic.title,
+                author=topic.author,
+                tags=topic.tags,
+                synced_at=datetime.now(timezone.utc).isoformat(),
+            )
+            if record.topic_title and record.topic_title != topic.title:
+                actor = discourse_actor or "Unknown"
+                await self._thread_log(
+                    topic_id=topic_id,
+                    message=(
+                        f"{LOG_TAG_SYSTEM}: Application title changed to {topic.title} "
+                        f"(by {actor}, discourse)"
+                    ),
+                )
+            await self._sync_thread_title(topic_id=topic_id, topic_title=topic.title)
+            await self._ensure_thread_controls(topic_id=topic_id, allow_create=False)
 
             suppress_echo = False
             if previous_tags is not None and previous_tags != topic.tags:
@@ -677,14 +1487,17 @@ class BotService(discord.Client):
                         )
                         await self._thread_log(
                             topic_id=topic_id,
-                            message=self._accepted_archive_message(),
+                            message=f"{LOG_TAG_SYSTEM}: {self._accepted_archive_message()}",
                         )
                     elif reopened:
                         await self.db.mark_accepted(topic_id=topic_id, accepted=False)
                         await self.db.set_archive_status(topic_id=topic_id, status=None)
                         await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
                         self._cancel_archive(topic_id=topic_id)
-                        await self._thread_log(topic_id=topic_id, message="Reopened (Accepted removed).")
+                        await self._thread_log(
+                            topic_id=topic_id,
+                            message=f"{LOG_TAG_STATUS}: Reopened (Accepted removed).",
+                        )
 
             # If Discourse tags changed, log it in the thread (if one exists), unless it matches
             # tags we just wrote from Discord (to avoid duplicate "echo" logs).
@@ -694,10 +1507,7 @@ class BotService(discord.Client):
                 actor = discourse_actor or "Unknown"
                 await self._thread_log(
                     topic_id=topic_id,
-                    message=(
-                        f"Status (discourse) changed by {actor}: "
-                        f"**{prev_stage}** -> **{new_stage}**"
-                    ),
+                    message=f"{self._format_status_update(new_stage)} (by {actor}, discourse)",
                 )
             return
 
@@ -717,7 +1527,24 @@ class BotService(discord.Client):
             discord_message_id=msg.id,
             discord_thread_id=None,
             tags_last_seen=topic.tags,
+            topic_title=topic.title,
+            topic_author=topic.author,
+            topic_synced_at=datetime.now(timezone.utc).isoformat(),
         )
+
+        try:
+            _ = await self._create_thread_if_needed(
+                channel=channel,
+                message=msg,
+                topic_title=topic.title,
+                topic_id=topic_id,
+            )
+            thread = await self._get_thread_for_topic(topic_id=topic_id)
+            if thread:
+                await self._add_thread_members(thread=thread, claimed_user_id=None)
+            await self._ensure_thread_controls(topic_id=topic_id, allow_create=True)
+        except Exception:
+            log.exception("Failed to create thread for new application (topic_id=%s)", topic_id)
 
         if self._is_accepted(topic.tags):
             delay_minutes = self._accepted_archive_delay_minutes()
@@ -731,6 +1558,27 @@ class BotService(discord.Client):
                 reason="discourse-accepted-initial",
             )
 
+    def _truncate_thread_name(self, name: str) -> str:
+        base = name.strip()
+        return base[:100] if len(base) > 100 else base
+
+    async def _sync_thread_title(self, *, topic_id: int, topic_title: str) -> None:
+        record = await self.db.get_application(topic_id)
+        if not record or not record.discord_thread_id:
+            return
+        thread = await self._get_thread_for_topic(topic_id=topic_id)
+        if not thread:
+            return
+        new_name = self._truncate_thread_name(topic_title)
+        if thread.name == new_name:
+            return
+        try:
+            await self._record_thread_name(topic_id=topic_id, name=thread.name)
+            await thread.edit(name=new_name)
+            await self._record_thread_name(topic_id=topic_id, name=new_name)
+        except Exception:
+            pass
+
     async def _create_thread_if_needed(
         self,
         *,
@@ -743,8 +1591,7 @@ class BotService(discord.Client):
         if record and record.discord_thread_id:
             return record.discord_thread_id
 
-        base_name = f"{topic_title}".strip()
-        thread_name = base_name[:100] if len(base_name) > 100 else base_name
+        thread_name = self._truncate_thread_name(topic_title)
 
         # Discord does not support disabling auto-archive. Prefer the maximum, but fall back
         # if the guild does not allow it.
@@ -777,6 +1624,7 @@ class BotService(discord.Client):
             raise last_error or RuntimeError("Failed to create thread")
 
         await self.db.set_thread_id(topic_id=topic_id, thread_id=thread.id)
+        await self._record_thread_name(topic_id=topic_id, name=thread.name)
         return thread.id
 
     async def _create_archive_thread(
@@ -785,8 +1633,7 @@ class BotService(discord.Client):
         message: discord.Message,
         topic_title: str,
     ) -> discord.Thread:
-        base_name = f"Application - {topic_title}".strip()
-        thread_name = base_name[:100] if len(base_name) > 100 else base_name
+        thread_name = self._truncate_thread_name(f"Application - {topic_title}")
         archive_options = (10080, 4320, 1440)
         last_error: Exception | None = None
         for duration in archive_options:
@@ -803,20 +1650,26 @@ class BotService(discord.Client):
         self,
         *,
         channel: discord.TextChannel,
-        thread: discord.Thread,
+        thread: discord.Thread | None,
+        thread_names: list[str] | None = None,
     ) -> None:
         try:
+            names = [n for n in (thread_names or []) if n]
+            if thread:
+                names.append(thread.name)
             async for msg in channel.history(limit=50):
                 if msg.type == discord.MessageType.thread_created:
                     msg_thread = getattr(msg, "thread", None)
-                    if msg_thread and msg_thread.id == thread.id:
+                    if thread and msg_thread and msg_thread.id == thread.id:
                         await msg.delete()
                         return
-                    if thread.name and thread.name in msg.content:
-                        await msg.delete()
-                        return
+                    for name in names:
+                        if name and name in msg.content:
+                            await msg.delete()
+                            return
         except Exception:
-            log.exception("Failed to delete thread system message (thread_id=%s)", thread.id)
+            thread_id = thread.id if thread else "unknown"
+            log.exception("Failed to delete thread system message (thread_id=%s)", thread_id)
 
     async def handle_claim(self, interaction: discord.Interaction, *, topic_id: int) -> None:
         try:
@@ -849,47 +1702,48 @@ class BotService(discord.Client):
             processing=True,
             processing_label="Claiming...",
         )
-        responded = False
-        if interaction.message:
-            try:
-                await interaction.response.edit_message(view=processing_view)
-                responded = True
-            except Exception:
-                responded = False
-        deferred = False if responded else await self._defer_interaction(interaction)
+        deferred = await self._show_processing(
+            interaction=interaction,
+            topic_id=topic_id,
+            view=processing_view,
+        )
 
         record = await self.db.get_application(topic_id)
         if not record:
             await self._respond_ephemeral(interaction, "Internal error: missing record.")
             return
-        had_thread = bool(record.discord_thread_id)
-
-        channel = self.get_channel(record.discord_channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            await self._respond_ephemeral(interaction, "Internal error: channel missing.")
-            return
-
-        msg = await channel.fetch_message(record.discord_message_id)
-        topic = await self.discourse.fetch_topic(topic_id)
-        if not responded:
-            notify_msg = await self._get_notify_message(topic_id=topic_id)
-            if notify_msg:
-                try:
-                    await notify_msg.edit(view=processing_view)
-                except Exception:
-                    pass
-
-        thread_id = await self._create_thread_if_needed(
-            channel=channel,
-            message=msg,
-            topic_title=topic.title,
-            topic_id=topic_id,
-        )
-        _ = thread_id
-        await self._ensure_thread_controls(topic_id=topic_id)
+        await self._apply_processing_view(topic_id=topic_id, label="Claiming...")
+        thread = await self._get_thread_for_topic(topic_id=topic_id)
+        if thread is None:
+            _, target_channel_id = self._target_ids()
+            channel: discord.TextChannel | None = None
+            msg: discord.Message | None = None
+            if interaction.channel and interaction.channel.id == target_channel_id:
+                if isinstance(interaction.channel, discord.TextChannel):
+                    channel = interaction.channel
+                    msg = interaction.message
+            if not msg and not record.discord_message_missing:
+                channel = self.get_channel(record.discord_channel_id)
+                if isinstance(channel, discord.TextChannel):
+                    try:
+                        msg = await channel.fetch_message(record.discord_message_id)
+                    except Exception:
+                        msg = None
+            if channel and msg:
+                topic = await self.discourse.fetch_topic(topic_id)
+                await self._create_thread_if_needed(
+                    channel=channel,
+                    message=msg,
+                    topic_title=topic.title,
+                    topic_id=topic_id,
+                )
+                thread = await self._get_thread_for_topic(topic_id=topic_id)
+        if thread:
+            await self._add_thread_members(thread=thread, claimed_user_id=interaction.user.id)
+        await self._ensure_thread_controls(topic_id=topic_id, allow_create=True)
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Claimed by {self._user_label(interaction.user)}.",
+            message=f"{LOG_TAG_ASSIGN}: Claimed by {self._user_display_name(interaction.user)}.",
         )
 
         await self.handle_discourse_topic_event(topic_id=topic_id)
@@ -906,11 +1760,12 @@ class BotService(discord.Client):
             await self._respond_ephemeral(interaction, "Unexpected user type.")
             return
 
-        if not self._member_has_override_permission(interaction.user):
-            await self._respond_ephemeral(interaction, "Only RRO / ICs can unclaim.")
-            return
-
         before = await self.db.get_application(topic_id)
+        is_owner = bool(before and before.claimed_by_user_id == interaction.user.id)
+        is_override = self._member_has_override_permission(interaction.user)
+        if not is_owner and not is_override:
+            await self._respond_ephemeral(interaction, "Only the owner or override roles can unclaim.")
+            return
         await self.db.force_claim(topic_id=topic_id, user_id=None)
         if self.config.is_dry_run:
             await self._respond_ephemeral(interaction, "dry-run: unclaimed in DB.")
@@ -924,32 +1779,28 @@ class BotService(discord.Client):
             processing=True,
             processing_label="Unclaiming...",
         )
-        responded = False
-        if interaction.message:
-            try:
-                await interaction.response.edit_message(view=processing_view)
-                responded = True
-            except Exception:
-                responded = False
-        deferred = False if responded else await self._defer_interaction(interaction)
-        if not responded:
-            try:
-                if interaction.message:
-                    await interaction.message.edit(view=processing_view)
-                else:
-                    notify_msg = await self._get_notify_message(topic_id=topic_id)
-                    if notify_msg:
-                        await notify_msg.edit(view=processing_view)
-            except Exception:
-                pass
+        deferred = await self._show_processing(
+            interaction=interaction,
+            topic_id=topic_id,
+            view=processing_view,
+        )
 
-        await self._ensure_thread_controls(topic_id=topic_id)
+        await self._apply_processing_view(topic_id=topic_id, label="Unclaiming...")
+        await self._ensure_thread_for_action(
+            topic_id=topic_id,
+            interaction=interaction,
+            claimed_user_id=None,
+        )
+        await self._ensure_thread_controls(topic_id=topic_id, allow_create=True)
         await self.handle_discourse_topic_event(topic_id=topic_id)
         previous = await self._resolve_claimed_user(user_id=before.claimed_by_user_id) if before else None
         prev_text = self._user_label(previous)
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Unclaimed by {self._user_label(interaction.user)} (previous owner: {prev_text}).",
+            message=(
+                f"{LOG_TAG_ASSIGN}: Unclaimed by {self._user_label(interaction.user)} "
+                f"(previous owner: {prev_text})."
+            ),
         )
         await self._finish_interaction(interaction, deferred=deferred)
 
@@ -965,7 +1816,7 @@ class BotService(discord.Client):
             return
 
         if not self._member_has_admin_permission(interaction.user):
-            await self._respond_ephemeral(interaction, "Only override roles can reassign.")
+            await self._respond_ephemeral(interaction, "You do not have permission to reassign.")
             return
 
         record = await self.db.get_application(topic_id)
@@ -978,27 +1829,20 @@ class BotService(discord.Client):
             processing=True,
             processing_label="Loading assignees...",
         )
-        responded = False
-        if interaction.message:
-            try:
-                await interaction.response.edit_message(view=processing_view)
-                responded = True
-            except Exception:
-                responded = False
-        deferred = False
-        if not responded:
-            try:
-                deferred = await self._defer_interaction(interaction)
-                if interaction.message:
-                    await interaction.message.edit(view=processing_view)
-                else:
-                    notify_msg = await self._get_notify_message(topic_id=topic_id)
-                    if notify_msg:
-                        await notify_msg.edit(view=processing_view)
-            except Exception:
-                pass
-            if deferred:
-                await self._finish_interaction(interaction, deferred=deferred)
+        deferred = await self._show_processing(
+            interaction=interaction,
+            topic_id=topic_id,
+            view=processing_view,
+        )
+        if deferred:
+            await self._finish_interaction(interaction, deferred=deferred)
+
+        await self._apply_processing_view(topic_id=topic_id, label="Loading assignees...")
+        await self._ensure_thread_for_action(
+            topic_id=topic_id,
+            interaction=interaction,
+            claimed_user_id=record.claimed_by_user_id if record else None,
+        )
 
         # Show a temporary user selector on the message where the button was clicked.
         options = await self._build_reassign_options()
@@ -1022,7 +1866,7 @@ class BotService(discord.Client):
             and record.discord_control_message_id == interaction.message.id
         )
         if not target_is_thread_controls:
-            await self._ensure_thread_controls(topic_id=topic_id)
+            await self._ensure_thread_controls(topic_id=topic_id, allow_create=True)
 
     async def handle_force_claim(self, interaction: discord.Interaction, *, topic_id: int, new_user_id: int) -> None:
         await self.db.force_claim(topic_id=topic_id, user_id=new_user_id)
@@ -1047,7 +1891,7 @@ class BotService(discord.Client):
             return
 
         if not self._member_has_admin_permission(interaction.user):
-            await self._respond_ephemeral(interaction, "Only override roles can reassign.")
+            await self._respond_ephemeral(interaction, "You do not have permission to reassign.")
             return
 
         guild_id, _ = self._target_ids()
@@ -1074,37 +1918,33 @@ class BotService(discord.Client):
             processing=True,
             processing_label=processing_label,
         )
-        responded = False
-        if interaction.message:
-            try:
-                await interaction.response.edit_message(view=processing_view)
-                responded = True
-            except Exception:
-                responded = False
-        deferred = False
-        if not responded:
-            deferred = await self._defer_interaction(interaction)
-            try:
-                if interaction.message:
-                    await interaction.message.edit(view=processing_view)
-                else:
-                    notify_msg = await self._get_notify_message(topic_id=topic_id)
-                    if notify_msg:
-                        await notify_msg.edit(view=processing_view)
-            except Exception:
-                pass
+        deferred = await self._show_processing(
+            interaction=interaction,
+            topic_id=topic_id,
+            view=processing_view,
+        )
 
+        await self._apply_processing_view(topic_id=topic_id, label=processing_label)
         await self.db.force_claim(topic_id=topic_id, user_id=new_user_id)
         await self.handle_discourse_topic_event(topic_id=topic_id)
 
-        await self._ensure_thread_controls(topic_id=topic_id)
+        await self._ensure_thread_for_action(
+            topic_id=topic_id,
+            interaction=interaction,
+            claimed_user_id=new_user_id,
+        )
+
+        await self._ensure_thread_controls(topic_id=topic_id, allow_create=True)
         previous = await self._resolve_claimed_user(user_id=before.claimed_by_user_id) if before else None
         prev_text = self._user_label(previous)
         new_user = target_member or await self._resolve_claimed_user(user_id=new_user_id)
         new_text = self._user_label(new_user) if new_user else f"User {new_user_id}"
         await self._thread_log(
             topic_id=topic_id,
-            message=f"Reassigned by {self._user_label(interaction.user)}: {prev_text} -> {new_text}.",
+            message=(
+                f"{LOG_TAG_ASSIGN}: Reassigned by {self._user_label(interaction.user)}: "
+                f"{prev_text} -> {new_text}."
+            ),
         )
         await self._finish_interaction(interaction, deferred=deferred)
 
@@ -1119,7 +1959,10 @@ class BotService(discord.Client):
             await self._respond_ephemeral(interaction, "Unexpected user type.")
             return
 
-        if not self._member_has_override_permission(interaction.user):
+        if not (
+            self._member_has_claim_permission(interaction.user)
+            or self._member_has_override_permission(interaction.user)
+        ):
             await self._respond_ephemeral(interaction, "You do not have permission to change stage.")
             return
 
@@ -1132,25 +1975,18 @@ class BotService(discord.Client):
             processing=True,
             processing_label="Updating status...",
         )
-        responded = False
-        if interaction.message:
-            try:
-                await interaction.response.edit_message(view=processing_view)
-                responded = True
-            except Exception:
-                responded = False
-        deferred = False
-        if not responded:
-            deferred = await self._defer_interaction(interaction)
-            try:
-                if interaction.message:
-                    await interaction.message.edit(view=processing_view)
-                else:
-                    notify_msg = await self._get_notify_message(topic_id=topic_id)
-                    if notify_msg:
-                        await notify_msg.edit(view=processing_view)
-            except Exception:
-                pass
+        deferred = await self._show_processing(
+            interaction=interaction,
+            topic_id=topic_id,
+            view=processing_view,
+        )
+
+        await self._apply_processing_view(topic_id=topic_id, label="Updating status...")
+        await self._ensure_thread_for_action(
+            topic_id=topic_id,
+            interaction=interaction,
+            claimed_user_id=record.claimed_by_user_id if record else None,
+        )
 
         topic = await self.discourse.fetch_topic(topic_id)
         current = list(topic.tags)
@@ -1181,11 +2017,11 @@ class BotService(discord.Client):
         await self._thread_log(
             topic_id=topic_id,
             message=(
-                f"Status (discord) changed by {self._user_label(interaction.user)}: "
-                f"**{prev_stage}** -> **{new_stage}**"
+                f"{self._format_status_update(new_stage)} "
+                f"(by {self._user_display_name(interaction.user)}, discord)"
             ),
         )
-        await self._ensure_thread_controls(topic_id=topic_id)
+        await self._ensure_thread_controls(topic_id=topic_id, allow_create=True)
 
         if stage_tag_lower == "p-file":
             delay_minutes = self._accepted_archive_delay_minutes()
@@ -1201,7 +2037,7 @@ class BotService(discord.Client):
             )
             await self._thread_log(
                 topic_id=topic_id,
-                message=self._accepted_archive_message(),
+                message=f"{LOG_TAG_SYSTEM}: {self._accepted_archive_message()}",
             )
         elif stage_tag_lower == "reject":
             delay_minutes = self._accepted_archive_delay_minutes()
@@ -1216,27 +2052,98 @@ class BotService(discord.Client):
             )
             await self._thread_log(
                 topic_id=topic_id,
-                message=self._rejected_archive_message(),
+                message=f"{LOG_TAG_SYSTEM}: {self._rejected_archive_message()}",
             )
         elif self._is_accepted(current) and stage_tag_lower != "p-file":
             await self.db.mark_accepted(topic_id=topic_id, accepted=False)
             await self.db.set_archive_status(topic_id=topic_id, status=None)
             await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
             self._cancel_archive(topic_id=topic_id)
-            await self._thread_log(topic_id=topic_id, message="Reopened (Accepted removed).")
+            await self._thread_log(
+                topic_id=topic_id,
+                message=f"{LOG_TAG_STATUS}: Reopened (Accepted removed).",
+            )
         elif stage_tag_lower not in ("p-file", "reject"):
             await self.db.set_archive_status(topic_id=topic_id, status=None)
             await self.db.schedule_archive(topic_id=topic_id, when_iso=None)
             self._cancel_archive(topic_id=topic_id)
-        # Update message without posting extra chatter.
-        try:
-            embed, view = await self._render_for_topic(topic_id=topic_id)
-            notify_msg = await self._get_notify_message(topic_id=topic_id)
-            if notify_msg:
-                await notify_msg.edit(embed=embed, view=view)
-        except Exception:
-            pass
         await self._finish_interaction(interaction, deferred=deferred)
+
+    async def handle_rename_topic(self, interaction: discord.Interaction, *, topic_id: int) -> None:
+        try:
+            await self._ensure_interaction_allowed_for_topic(interaction, topic_id=topic_id)
+        except PermissionError as e:
+            await self._respond_ephemeral(interaction, str(e))
+            return
+
+        if not isinstance(interaction.user, discord.Member):
+            await self._respond_ephemeral(interaction, "Unexpected user type.")
+            return
+
+        record = await self.db.get_application(topic_id)
+        is_owner = bool(record and record.claimed_by_user_id == interaction.user.id)
+        if not (is_owner or self._member_has_override_permission(interaction.user)):
+            await self._respond_ephemeral(interaction, "You do not have permission to rename topics.")
+            return
+
+        try:
+            topic = await self.discourse.fetch_topic(topic_id)
+        except Exception:
+            topic = None
+        modal = RenameTopicModal(
+            service=self,
+            topic_id=topic_id,
+            current_title=topic.title if topic else None,
+        )
+        await interaction.response.send_modal(modal)
+
+    async def handle_rename_topic_submit(
+        self,
+        interaction: discord.Interaction,
+        *,
+        topic_id: int,
+        new_title: str,
+    ) -> None:
+        cleaned = new_title.strip()
+        if not cleaned:
+            await interaction.response.send_message("Title cannot be empty.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        await self._apply_processing_view(topic_id=topic_id, label="Renaming...")
+
+        if self.config.is_dry_run:
+            await self._finish_interaction(interaction, deferred=True, message=None)
+            return
+
+        try:
+            await self.discourse.set_topic_title(topic_id, cleaned)
+        except Exception:
+            log.exception("Failed to rename topic (topic_id=%s)", topic_id)
+            return
+
+        record = await self.db.get_application(topic_id)
+        if record:
+            await self.db.set_topic_snapshot(
+                topic_id=topic_id,
+                title=cleaned,
+                author=record.topic_author,
+                tags=record.tags_last_seen,
+                synced_at=datetime.now(timezone.utc).isoformat(),
+            )
+        await self._sync_thread_title(topic_id=topic_id, topic_title=cleaned)
+        await self._thread_log(
+            topic_id=topic_id,
+            message=(
+                f"{LOG_TAG_SYSTEM}: Application title changed to {cleaned} "
+                f"(by {self._user_display_name(interaction.user)}, discord)"
+            ),
+        )
+
+        await self.handle_discourse_topic_event(
+            topic_id=topic_id,
+            event_type="topic_edited",
+        )
 
 
 def _verify_discourse_signature(
@@ -1365,7 +2272,7 @@ async def create_web_app(*, config: BotConfig, bot: BotService) -> web.Applicati
 
 
 async def run() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _configure_logging()
     config = load_config()
 
     async with aiohttp.ClientSession() as session:

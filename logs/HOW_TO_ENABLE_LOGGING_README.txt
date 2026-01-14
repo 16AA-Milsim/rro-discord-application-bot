@@ -1,31 +1,15 @@
-Enable logging for the Discourse → Discord relay service (NSSM)
+Logging configuration for the Discord bot
 
-Service name:
-  16AA RRO Applications Bot
+Default behavior:
+- INFO level logging to both console and a rotating file at logs/bot.log.
+- Rotation defaults: 10 MB max, 5 backups.
 
-NSSM path:
-  F:\16AA\zOther\nssm-2.24\win64\nssm.exe
+Environment variables (set in .env):
+- LOG_LEVEL: DEBUG | INFO | WARNING | ERROR (default: INFO)
+- LOG_FILE: path to log file (default: logs/bot.log). Set empty to disable file logging.
+- LOG_MAX_BYTES: max file size before rotation (default: 10485760)
+- LOG_BACKUP_COUNT: number of rotated files to keep (default: 5)
+- LOG_TO_CONSOLE: 1 or 0 (default: 1)
 
-1) Open PowerShell as Administrator.
-
-2) Stop the service:
-  net stop "16AA RRO Applications Bot"
-
-3) Enable log files:
-  F:\16AA\zOther\nssm-2.24\win64\nssm.exe set "16AA RRO Applications Bot" AppStdout "F:\16AA\zOther\rro_discord_application_bot\logs\stdout.log"
-  F:\16AA\zOther\nssm-2.24\win64\nssm.exe set "16AA RRO Applications Bot" AppStderr "F:\16AA\zOther\rro_discord_application_bot\logs\stderr.log"
-
-4) (Optional) Enable rotation (10 MB, online):
-  F:\16AA\zOther\nssm-2.24\win64\nssm.exe set "16AA RRO Applications Bot" AppRotateFiles 1
-  F:\16AA\zOther\nssm-2.24\win64\nssm.exe set "16AA RRO Applications Bot" AppRotateOnline 1
-  F:\16AA\zOther\nssm-2.24\win64\nssm.exe set "16AA RRO Applications Bot" AppRotateBytes 10485760
-
-5) Start the service:
-  net start "16AA RRO Applications Bot"
-
-Disable logging again (to prevent disk growth):
-  net stop "16AA RRO Applications Bot"
-  F:\16AA\zOther\nssm-2.24\win64\nssm.exe reset "16AA RRO Applications Bot" AppStdout
-  F:\16AA\zOther\nssm-2.24\win64\nssm.exe reset "16AA RRO Applications Bot" AppStderr
-  net start "16AA RRO Applications Bot"
-"@ | Set-Content -Path $readmePath -Encoding UTF8
+Troubleshooting:
+- For more detail, set LOG_LEVEL=DEBUG and restart the bot/service.
