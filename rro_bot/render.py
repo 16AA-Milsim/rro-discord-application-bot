@@ -38,15 +38,15 @@ def discourse_tags_to_stage_label(tags: list[str], *, icons: dict[str, str] | No
     if "p-file" in tags_set:
         return "✅ Accepted"
     if "on-hold" in tags_set:
-        return f"{icon('yellow_pause', '⏸️')} On Hold"
+        return f"{icon('pause', '⏸️')} On Hold"
     if "interview-held" in tags_set:
-        return f"{icon('lime_calendar', '🟩📅')} Interview Held"
+        return f"{icon('interview_held', '🟨📅')} Interview Held"
     if "interview-scheduled" in tags_set:
-        return f"{icon('yellow_calendar', '🟨📅')} Interview Scheduled"
+        return f"{icon('interview_scheduled', '🟨📅')} Interview Scheduled"
     if "letter-sent" in tags_set:
-        return f"{icon('orange_letter', '🟧✉️')} Letter Sent"
+        return f"{icon('letter_sent', '🟧✉️')} Letter Sent"
     if "new-application" in tags_set:
-        return f"{icon('blue_star', '🔷')} New Application"
+        return f"{icon('new_application', '🔷')} New Application"
     return "Unknown"
 
 
@@ -71,7 +71,7 @@ def build_application_embed(
         title=f"{topic.title}" if topic.title else "New application",
         url=topic.url,
         description=f"Submitted by **{topic.author}**",
-        color=0x940039,
+        color=0xAFCBFF,
     )
     embed.add_field(name="Status", value=stage_label, inline=False)
     embed.add_field(

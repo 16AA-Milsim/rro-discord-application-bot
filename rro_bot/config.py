@@ -49,6 +49,7 @@ class BotConfig:
 
     discord_guild_id: int
     discord_notify_channel_id: int
+    discord_archive_channel_id: int
     discord_test_guild_id: int
     discord_test_notify_channel_id: int
     discord_test_archive_channel_id: int
@@ -56,17 +57,20 @@ class BotConfig:
 
     discord_allowed_role_names: tuple[str, ...]
     discord_override_role_names: tuple[str, ...]
+    discord_thread_autoadd_role_names: tuple[str, ...]
 
     discourse_base_url: str
     discourse_webhook_secrets: tuple[str, ...]
     discourse_signature_debug: bool
     discourse_api_key: str
     discourse_api_user: str
+    discourse_topic_cache_ttl_seconds: int
 
     listen_host: str
     listen_port: int
 
-    applications_category_id: int = 328
+    applications_category_id: int
+    discourse_test_applications_category_id: int
     database_path: str = "bot.db"
 
     @property
@@ -76,6 +80,10 @@ class BotConfig:
     def target_guild_and_channel(self) -> tuple[int, int]:
         mode = self.discord_mode.lower()
         if mode in ("test", "dry-run"):
+            if not self.discord_test_guild_id or not self.discord_test_notify_channel_id:
+                raise RuntimeError(
+                    "DISCORD_TEST_GUILD_ID and DISCORD_TEST_NOTIFY_CHANNEL_ID must be set for DISCORD_MODE=test or dry-run"
+                )
             return self.discord_test_guild_id, self.discord_test_notify_channel_id
         if mode == "prod":
             if not self.discord_allow_prod:
@@ -94,8 +102,14 @@ class BotConfig:
         if mode in ("test", "dry-run"):
             return self.discord_test_archive_channel_id
         if mode == "prod":
-            return 0
+            return self.discord_archive_channel_id
         return 0
+
+    def target_applications_category_id(self) -> int:
+        mode = self.discord_mode.lower()
+        if mode in ("test", "dry-run"):
+            return self.discourse_test_applications_category_id
+        return self.applications_category_id
 
 
 def load_config() -> BotConfig:
@@ -106,16 +120,21 @@ def load_config() -> BotConfig:
         single = os.environ.get("DISCOURSE_WEBHOOK_SECRET", "").strip()
         discourse_webhook_secrets = (single,) if single else tuple()
 
+    base_applications_category_id = _get_env_int("DISCOURSE_APPLICATIONS_CATEGORY_ID", 328)
+    test_applications_category_id = _get_env_int(
+        "DISCOURSE_TEST_APPLICATIONS_CATEGORY_ID",
+        base_applications_category_id,
+    )
+
     return BotConfig(
         discord_bot_token=_get_env("DISCORD_BOT_TOKEN"),
         discord_mode=os.environ.get("DISCORD_MODE", "test").strip(),
         discord_allow_prod=os.environ.get("DISCORD_ALLOW_PROD", "0").strip() == "1",
         discord_guild_id=_get_env_int("DISCORD_GUILD_ID", 0),
         discord_notify_channel_id=_get_env_int("DISCORD_NOTIFY_CHANNEL_ID", 0),
-        discord_test_guild_id=_get_env_int("DISCORD_TEST_GUILD_ID", 1068904351692771480),
-        discord_test_notify_channel_id=_get_env_int(
-            "DISCORD_TEST_NOTIFY_CHANNEL_ID", 1460263195292864552
-        ),
+        discord_archive_channel_id=_get_env_int("DISCORD_ARCHIVE_CHANNEL_ID", 0),
+        discord_test_guild_id=_get_env_int("DISCORD_TEST_GUILD_ID", 0),
+        discord_test_notify_channel_id=_get_env_int("DISCORD_TEST_NOTIFY_CHANNEL_ID", 0),
         discord_test_archive_channel_id=_get_env_int("DISCORD_TEST_ARCHIVE_CHANNEL_ID", 0),
         accepted_archive_delay_minutes=max(
             0,
@@ -127,11 +146,20 @@ def load_config() -> BotConfig:
         discord_override_role_names=tuple(
             _split_csv(os.environ.get("DISCORD_OVERRIDE_ROLE_NAMES", "RRO ICs,REME Discord"))
         ),
+        discord_thread_autoadd_role_names=tuple(
+            _split_csv(os.environ.get("DISCORD_THREAD_AUTOADD_ROLE_NAMES", "RRO,RRO ICs"))
+        ),
         discourse_base_url=os.environ.get("DISCOURSE_BASE_URL", "https://discourse.16aa.net").rstrip("/"),
         discourse_webhook_secrets=discourse_webhook_secrets,
         discourse_signature_debug=_get_env_bool("DISCOURSE_SIGNATURE_DEBUG", False),
         discourse_api_key=os.environ.get("DISCOURSE_API_KEY", "").strip(),
         discourse_api_user=os.environ.get("DISCOURSE_API_USER", "").strip(),
+        discourse_topic_cache_ttl_seconds=max(
+            0,
+            _get_env_int("DISCOURSE_TOPIC_CACHE_TTL_SECONDS", 300),
+        ),
         listen_host=os.environ.get("LISTEN_HOST", "0.0.0.0").strip(),
         listen_port=_get_env_int("LISTEN_PORT", 5055),
+        applications_category_id=base_applications_category_id,
+        discourse_test_applications_category_id=test_applications_category_id,
     )

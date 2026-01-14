@@ -14,6 +14,7 @@ class ApplicationView(discord.ui.View):
         claimed: bool,
         processing: bool = False,
         processing_label: str = "Processing...",
+        processing_style: discord.ButtonStyle = discord.ButtonStyle.secondary,
         show_reassign_selector: bool = False,
         reassign_options: list[tuple[int, str]] | None = None,
     ):
@@ -26,7 +27,7 @@ class ApplicationView(discord.ui.View):
         if processing:
             claim_button = discord.ui.Button(
                 label=processing_label,
-                style=discord.ButtonStyle.secondary,
+                style=processing_style,
                 disabled=True,
             )
             self.add_item(claim_button)
@@ -59,6 +60,16 @@ class ApplicationView(discord.ui.View):
         )
         reassign_button.callback = self._on_reassign  # type: ignore[assignment]
         self.add_item(reassign_button)
+
+        rename_button = discord.ui.Button(
+            label="Rename Title",
+            style=discord.ButtonStyle.secondary,
+            disabled=processing,
+            custom_id=f"app_rename:{topic_id}",
+            row=1,
+        )
+        rename_button.callback = self._on_rename  # type: ignore[assignment]
+        self.add_item(rename_button)
 
         if self._show_reassign_selector:
             options = [
@@ -138,6 +149,36 @@ class ApplicationView(discord.ui.View):
 
     async def _on_reassign(self, interaction: discord.Interaction) -> None:
         await self._service.handle_reassign(interaction, topic_id=self._topic_id)
+
+    async def _on_rename(self, interaction: discord.Interaction) -> None:
+        await self._service.handle_rename_topic(interaction, topic_id=self._topic_id)
+
+
+class RenameTopicModal(discord.ui.Modal):
+    def __init__(
+        self,
+        *,
+        service: "BotService",
+        topic_id: int,
+        current_title: str | None = None,
+    ):
+        super().__init__(title="Rename Topic")
+        self._service = service
+        self._topic_id = topic_id
+        self._title_input = discord.ui.TextInput(
+            label="New title",
+            max_length=200,
+            required=True,
+            default=current_title or "",
+        )
+        self.add_item(self._title_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self._service.handle_rename_topic_submit(
+            interaction,
+            topic_id=self._topic_id,
+            new_title=str(self._title_input.value),
+        )
 
 
 from typing import TYPE_CHECKING
